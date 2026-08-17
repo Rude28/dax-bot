@@ -1,5 +1,4 @@
 import threading
-import time
 
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
@@ -15,7 +14,7 @@ HOST = "127.0.0.1"
 PORT = 4002
 CLIENT_ID = 4
 
-# FDXM SEP26 obtenido previamente mediante find_fdxm.py
+# FDXM SEP26 obtenido mediante find_fdxm.py
 CON_ID = 655095900
 EXCHANGE = "EUREX"
 
@@ -31,14 +30,32 @@ class PaperExecutor(EWrapper, EClient):
     def __init__(self):
         EClient.__init__(self, self)
 
-        self.next_order_id = None
+        # -----------------------------
+        # Conexión
+        # -----------------------------
 
-        self.position = 0
+        self.next_order_id = None
+        self.connection_ready = threading.Event()
+
+        # -----------------------------
+        # Posición
+        # -----------------------------
+
+        self.current_position = 0.0
         self.position_avg_cost = 0.0
 
-        self.position_event = threading.Event()
+        # Evento que indica que IBKR
+        # terminó de enviar las posiciones iniciales.
+        self.positions_ready = threading.Event()
+
+        # -----------------------------
+        # Órdenes
+        # -----------------------------
 
         self.order_event = threading.Event()
+
+        self.current_order_id = None
+
         self.order_status = None
         self.order_filled = 0
         self.order_remaining = 0
@@ -46,61 +63,146 @@ class PaperExecutor(EWrapper, EClient):
 
         self.error_message = None
 
-    # --------------------------------------------------------
+    # ========================================================
     # CONEXIÓN
-    # --------------------------------------------------------
+    # ========================================================
 
     def nextValidId(self, orderId):
-        self.next_order_id = orderId
 
+        self.next_order_id = orderId
+        self.connection_ready.set()
         print()
         print("========================================")
         print("CONEXIÓN CON IBKR CORRECTA")
         print(f"Next Order ID: {orderId}")
         print("========================================")
 
-    # --------------------------------------------------------
+        # ----------------------------------------------------
+        # IMPORTANTE:
+        # Nos suscribimos UNA SOLA VEZ a las posiciones.
+        # IBKR enviará las posiciones actuales y después
+        # cualquier actualización.
+        # ----------------------------------------------------
+
+        self.current_position = 0.0
+        self.position_avg_cost = 0.0
+        self.positions_ready.clear()
+
+        print("Solicitando posiciones iniciales...")
+
+        self.reqPositions()
+
+    # ========================================================
     # ERRORES
-    # --------------------------------------------------------
+    # ========================================================
 
     def error(
         self,
         reqId,
+        errorTime,
         errorCode,
         errorString,
         advancedOrderRejectJson=""
     ):
-        # Mensajes informativos de IBKR
+
+        # Mensajes informativos normales de IBKR.
         if errorCode in (2104, 2106, 2107, 2158):
+
             print(
                 f"IBKR INFO | code={errorCode} | "
                 f"{errorString}"
             )
+
             return
 
         print(
             f"IBKR ERROR | reqId={reqId} | "
-            f"code={errorCode} | message={errorString}"
+            f"code={errorCode} | "
+            f"message={errorString}"
         )
 
         self.error_message = errorString
 
-    # --------------------------------------------------------
+    # ========================================================
     # POSICIONES
-    # --------------------------------------------------------
+    # ========================================================
 
-    def position(self, account, contract, position, avgCost):
+    def position(
+        self,
+        account,
+        contract,
+        position,
+        avgCost
+    ):
 
+        # Solo nos interesa nuestro FDXM.
         if contract.conId == CON_ID:
-            self.position = float(position)
+
+            self.current_position = float(position)
             self.position_avg_cost = float(avgCost)
 
-    def positionEnd(self):
-        self.position_event.set()
+            print()
+            print("----------------------------------------")
+            print("ACTUALIZACIÓN DE POSICIÓN")
+            print(f"FDXM:          {self.current_position}")
+            print(f"Precio medio:  {self.position_avg_cost}")
+            print("----------------------------------------")
 
-    # --------------------------------------------------------
+    def positionEnd(self):
+
+        print()
+        print("Posiciones iniciales recibidas.")
+
+        self.positions_ready.set()
+
+        # IMPORTANTE:
+        # NO llamamos a cancelPositions().
+        #
+        # Queremos mantener la suscripción activa para
+        # recibir futuras actualizaciones automáticamente.
+
+    # ========================================================
+    # OBTENER POSICIÓN ACTUAL
+    # ========================================================
+
+    def get_position(self):
+
+        return self.current_position
+
+    # ========================================================
+    # CONTRATO
+    # ========================================================
+
+    def create_contract(self):
+
+        contract = Contract()
+
+        contract.conId = CON_ID
+        contract.exchange = EXCHANGE
+
+        return contract
+
+    # ========================================================
+    # CREAR ORDEN MARKET
+    # ========================================================
+
+    def create_market_order(self, action):
+
+        order = Order()
+
+        order.action = action
+        order.orderType = "MKT"
+        order.totalQuantity = QUANTITY
+        order.tif = "DAY"
+
+        # Enviar inmediatamente.
+        order.transmit = True
+
+        return order
+
+    # ========================================================
     # ESTADO DE LA ORDEN
-    # --------------------------------------------------------
+    # ========================================================
 
     def orderStatus(
         self,
@@ -117,7 +219,8 @@ class PaperExecutor(EWrapper, EClient):
         mktCapPrice
     ):
 
-        if orderId != getattr(self, "current_order_id", None):
+        # Ignorar órdenes que no sean la nuestra.
+        if orderId != self.current_order_id:
             return
 
         self.order_status = status
@@ -132,82 +235,37 @@ class PaperExecutor(EWrapper, EClient):
             f"Restante: {remaining}"
         )
 
+        # Estados terminales.
         if status in (
             "Filled",
             "Cancelled",
             "ApiCancelled",
             "Inactive"
         ):
+
             self.order_event.set()
 
-    # --------------------------------------------------------
-    # CONTRATO
-    # --------------------------------------------------------
-
-    def create_contract(self):
-
-        contract = Contract()
-
-        contract.conId = CON_ID
-        contract.exchange = EXCHANGE
-
-        return contract
-
-    # --------------------------------------------------------
-    # CONSULTAR POSICIÓN
-    # --------------------------------------------------------
-
-    def get_position(self):
-
-        self.position = 0
-        self.position_avg_cost = 0.0
-        self.position_event.clear()
-
-        self.reqPositions()
-
-        if not self.position_event.wait(timeout=5):
-            print("No se recibió respuesta de posiciones.")
-            return None
-
-        self.cancelPositions()
-
-        return self.position
-
-    # --------------------------------------------------------
-    # CREAR ORDEN
-    # --------------------------------------------------------
-
-    def create_market_order(self, action):
-
-        order = Order()
-
-        order.action = action
-        order.orderType = "MKT"
-        order.totalQuantity = QUANTITY
-        order.tif = "DAY"
-
-        # Queremos que se transmita inmediatamente.
-        order.transmit = True
-
-        return order
-
-    # --------------------------------------------------------
+    # ========================================================
     # ENVIAR ORDEN
-    # --------------------------------------------------------
+    # ========================================================
 
     def send_order(self, action):
 
         if self.next_order_id is None:
+
             print("Todavía no tenemos un Order ID.")
+
             return False
 
         contract = self.create_contract()
         order = self.create_market_order(action)
 
         order_id = self.next_order_id
+
         self.current_order_id = order_id
 
         self.order_event.clear()
+
         self.order_status = None
         self.order_filled = 0
         self.order_remaining = QUANTITY
@@ -230,12 +288,19 @@ class PaperExecutor(EWrapper, EClient):
 
         self.next_order_id += 1
 
-        # Esperamos hasta 30 segundos a que termine.
-        finished = self.order_event.wait(timeout=30)
+        # Esperamos máximo 30 segundos.
+        finished = self.order_event.wait(
+            timeout=30
+        )
 
         if not finished:
+
             print()
-            print("TIMEOUT: no se confirmó la ejecución.")
+            print(
+                "TIMEOUT: no se confirmó "
+                "la ejecución."
+            )
+
             return False
 
         if self.order_status == "Filled":
@@ -263,15 +328,18 @@ class PaperExecutor(EWrapper, EClient):
 
 
 # ============================================================
-# FUNCIONES DE TRADING
+# ABRIR LARGO
 # ============================================================
 
 def open_long(app):
 
     position = app.get_position()
 
-    if position is None:
-        return
+    print()
+    print(
+        f"Posición actual: "
+        f"{position} contratos"
+    )
 
     if position != 0:
 
@@ -282,6 +350,7 @@ def open_long(app):
         )
 
         print("Primero debes cerrarla.")
+
         return
 
     success = app.send_order("BUY")
@@ -292,12 +361,19 @@ def open_long(app):
         print(">>> OPERACIÓN ABIERTA: LARGO <<<")
 
 
+# ============================================================
+# ABRIR CORTO
+# ============================================================
+
 def open_short(app):
 
     position = app.get_position()
 
-    if position is None:
-        return
+    print()
+    print(
+        f"Posición actual: "
+        f"{position} contratos"
+    )
 
     if position != 0:
 
@@ -308,6 +384,7 @@ def open_short(app):
         )
 
         print("Primero debes cerrarla.")
+
         return
 
     success = app.send_order("SELL")
@@ -318,33 +395,40 @@ def open_short(app):
         print(">>> OPERACIÓN ABIERTA: CORTO <<<")
 
 
+# ============================================================
+# CERRAR POSICIÓN
+# ============================================================
+
 def close_position(app):
 
     position = app.get_position()
 
-    if position is None:
-        return
+    print()
+    print(
+        f"Posición actual: "
+        f"{position} contratos"
+    )
 
     if position == 0:
 
         print()
         print("No hay ninguna posición abierta.")
+
         return
 
+    # Largo → SELL para cerrar.
     if position > 0:
 
-        # Tenemos largo → vendemos para cerrar.
         action = "SELL"
 
+    # Corto → BUY para cerrar.
     else:
 
-        # Tenemos corto → compramos para cerrar.
         action = "BUY"
 
     quantity = abs(position)
 
-    # Para este MVP solo permitimos cerrar
-    # posiciones de 1 contrato.
+    # Este MVP trabaja solamente con 1 contrato.
     if quantity != QUANTITY:
 
         print()
@@ -384,6 +468,10 @@ def main():
         CLIENT_ID
     )
 
+    # --------------------------------------------------------
+    # Hilo que mantiene funcionando la API.
+    # --------------------------------------------------------
+
     api_thread = threading.Thread(
         target=app.run,
         daemon=True
@@ -391,15 +479,13 @@ def main():
 
     api_thread.start()
 
-    # Esperamos a que llegue nextValidId.
-    for _ in range(50):
+    # --------------------------------------------------------
+    # Esperamos a que IBKR confirme la conexión.
+    # --------------------------------------------------------
 
-        if app.next_order_id is not None:
-            break
-
-        time.sleep(0.1)
-
-    if app.next_order_id is None:
+    if not app.connection_ready.wait(
+        timeout=10
+    ):
 
         print()
         print(
@@ -408,7 +494,61 @@ def main():
         )
 
         app.disconnect()
+
         return
+
+    # --------------------------------------------------------
+    # Esperamos a recibir las posiciones iniciales.
+    # --------------------------------------------------------
+
+    print()
+    print("Esperando posiciones de IBKR...")
+
+    if not app.positions_ready.wait(
+        timeout=10
+    ):
+
+        print()
+        print(
+            "No se recibieron las posiciones "
+            "iniciales de IBKR."
+        )
+
+        app.disconnect()
+
+        return
+
+    # --------------------------------------------------------
+    # Mostrar posición inicial.
+    # --------------------------------------------------------
+
+    print()
+    print("========================================")
+    print("POSICIÓN INICIAL")
+    print("========================================")
+
+    print(
+        f"FDXM: "
+        f"{app.current_position} contratos"
+    )
+
+    if app.current_position > 0:
+
+        print("Dirección: LARGO")
+
+    elif app.current_position < 0:
+
+        print("Dirección: CORTO")
+
+    else:
+
+        print("Sin posición")
+
+    print("========================================")
+
+    # --------------------------------------------------------
+    # MENÚ
+    # --------------------------------------------------------
 
     while True:
 
@@ -416,62 +556,96 @@ def main():
         print("========================================")
         print("       EJECUTOR FDXM PAPER")
         print("========================================")
+
         print("1 - Abrir LARGO")
         print("2 - Abrir CORTO")
         print("3 - Cerrar posición")
         print("4 - Mostrar posición")
         print("5 - Salir")
+
         print("========================================")
 
-        option = input("Selecciona una opción: ").strip()
+        option = input(
+            "Selecciona una opción: "
+        ).strip()
+
+        # ----------------------------------------------------
+        # ABRIR LARGO
+        # ----------------------------------------------------
 
         if option == "1":
 
             open_long(app)
 
+        # ----------------------------------------------------
+        # ABRIR CORTO
+        # ----------------------------------------------------
+
         elif option == "2":
 
             open_short(app)
+
+        # ----------------------------------------------------
+        # CERRAR
+        # ----------------------------------------------------
 
         elif option == "3":
 
             close_position(app)
 
+        # ----------------------------------------------------
+        # MOSTRAR POSICIÓN
+        # ----------------------------------------------------
+
         elif option == "4":
 
             position = app.get_position()
 
-            if position is not None:
+            print()
+            print(
+                f"Posición FDXM: "
+                f"{position} contratos"
+            )
 
-                print()
-                print(
-                    f"Posición FDXM: "
-                    f"{position} contratos"
-                )
+            if position > 0:
 
-                if position > 0:
+                print("Dirección: LARGO")
 
-                    print("Dirección: LARGO")
+            elif position < 0:
 
-                elif position < 0:
+                print("Dirección: CORTO")
 
-                    print("Dirección: CORTO")
+            else:
 
-                else:
+                print("Sin posición")
 
-                    print("Sin posición")
+        # ----------------------------------------------------
+        # SALIR
+        # ----------------------------------------------------
 
         elif option == "5":
 
+            print()
             print("Cerrando programa...")
 
             app.disconnect()
+
             break
+
+        # ----------------------------------------------------
+        # OPCIÓN INCORRECTA
+        # ----------------------------------------------------
 
         else:
 
+            print()
             print("Opción no válida.")
 
 
+# ============================================================
+# INICIO
+# ============================================================
+
 if __name__ == "__main__":
+
     main()
