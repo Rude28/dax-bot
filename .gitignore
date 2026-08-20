@@ -23,3 +23,7 @@ logs/
 # Sistema operativo
 .DS_Store
 Thumbs.db
+
+# Estado local del bot
+data/processed_signals.json
+data/processed_signals.json.tmp

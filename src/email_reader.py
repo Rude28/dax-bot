@@ -1,15 +1,21 @@
 import imaplib
 import email
 import os
-import smtplib
 
 from email.header import decode_header
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
 from dotenv import load_dotenv
 
 from signal_parser import parse_signal
+from signal_state import (
+    SignalState,
+    NEW,
+    REJECTED,
+    SUCCESS,
+    FAILED,
+    PARTIAL,
+    PROCESSING,
+)
 
 
 # ============================================================
@@ -22,8 +28,13 @@ load_dotenv()
 # GMAIL
 # ------------------------------------------------------------
 
-GMAIL_USER = os.getenv("GMAIL_USER")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+GMAIL_USER = os.getenv(
+    "GMAIL_USER"
+)
+
+GMAIL_APP_PASSWORD = os.getenv(
+    "GMAIL_APP_PASSWORD"
+)
 
 # ------------------------------------------------------------
 # IMAP
@@ -42,72 +53,44 @@ IMAP_PORT = int(
 )
 
 # ------------------------------------------------------------
-# SMTP
-#
-# Lo utilizaremos para enviar los avisos de operaciones.
-# ------------------------------------------------------------
-
-SMTP_SERVER = os.getenv(
-    "SMTP_SERVER",
-    "smtp.gmail.com"
-)
-
-SMTP_PORT = int(
-    os.getenv(
-        "SMTP_PORT",
-        "465"
-    )
-)
-
-# ------------------------------------------------------------
-# CORREO AL QUE ENVIAREMOS LAS NOTIFICACIONES
-#
-# Si NOTIFY_EMAIL no está definido en .env,
-# utilizaremos GMAIL_USER.
-# ------------------------------------------------------------
-
-NOTIFY_EMAIL = os.getenv(
-    "NOTIFY_EMAIL",
-    GMAIL_USER
-)
-
-# ------------------------------------------------------------
 # PROVEEDOR DE SEÑALES
 # ------------------------------------------------------------
 
-SIGNAL_SENDER = "operativadax@gmail.com"
+SIGNAL_SENDER = (
+    "operativadax@gmail.com"
+)
 
-# ------------------------------------------------------------
-# DURANTE LAS PRUEBAS SOLO LEEREMOS LOS ÚLTIMOS 10.
-#
-# IMPORTANTE:
-# Cuando conectemos el bot en tiempo real NO debemos utilizar
-# este sistema para ejecutar automáticamente los últimos
-# correos históricos.
-#
-# Tendremos que implementar un sistema para detectar
-# únicamente correos NUEVOS.
-# ------------------------------------------------------------
 
-MAX_EMAILS = 10
+# ============================================================
+# GESTOR DE ESTADOS
+# ============================================================
+
+state_manager = SignalState()
 
 
 # ============================================================
 # DECODIFICAR CABECERAS
 # ============================================================
 
-def decode_mime_header(value):
+def decode_mime_header(
+    value
+):
 
     if not value:
         return ""
 
-    decoded = decode_header(value)
+    decoded = decode_header(
+        value
+    )
 
     result = ""
 
     for part, encoding in decoded:
 
-        if isinstance(part, bytes):
+        if isinstance(
+            part,
+            bytes
+        ):
 
             result += part.decode(
                 encoding or "utf-8",
@@ -122,127 +105,473 @@ def decode_mime_header(value):
 
 
 # ============================================================
-# ENVIAR NOTIFICACIÓN POR EMAIL
+# COMPROBAR ESTADO
 # ============================================================
 
-def send_notification(
-    subject,
-    body
+def get_existing_signal_status(
+    message_id
 ):
     """
-    Envía un correo de notificación.
+    Devuelve el estado actual de una señal.
 
-    Esta función queda preparada para utilizarla cuando
-    conectemos el lector de señales con el ejecutor IBKR.
+    None
+        → señal no registrada
 
-    IMPORTANTE:
-    Actualmente NO se llama desde el procesamiento de señales,
-    porque todavía no estamos ejecutando operaciones.
+    NEW
+        → pendiente de ejecución
 
-    Cuando conectemos paper_executor.py tendremos que llamar
-    a esta función:
+    PROCESSING
+        → en proceso
 
-        - DESPUÉS de recibir Filled
-        - indicando el precio real de ejecución
-        - indicando la acción realizada
-        - indicando la posición final
+    SUCCESS
+        → ejecutada correctamente
 
-    Y en caso de error:
+    FAILED
+        → ejecución fallida
 
-        - enviar aviso de fallo
-        - incluir el error recibido de IBKR
-        - indicar que la operación NO ha sido confirmada
+    PARTIAL
+        → ejecución parcial
+
+    REJECTED
+        → señal rechazada/no reconocida
     """
 
-    if not GMAIL_USER:
+    return state_manager.get_status(
+        message_id
+    )
 
-        print(
-            "ERROR NOTIFICACIÓN: "
-            "falta GMAIL_USER"
-        )
 
-        return False
+# ============================================================
+# CREAR SEÑAL BASE
+# ============================================================
 
-    if not GMAIL_APP_PASSWORD:
+def build_signal(
+    email_uid_text,
+    message_id,
+    sender,
+    subject,
+    date,
+    actions,
+    valid,
+    status,
+    error=None
+):
+    """
+    Construye una señal estructurada común para señales
+    válidas y rechazadas.
+    """
 
-        print(
-            "ERROR NOTIFICACIÓN: "
-            "falta GMAIL_APP_PASSWORD"
-        )
+    return {
+        "valid": valid,
 
-        return False
+        "status": status,
 
-    if not NOTIFY_EMAIL:
+        "email_uid": email_uid_text,
 
-        print(
-            "ERROR NOTIFICACIÓN: "
-            "falta NOTIFY_EMAIL"
-        )
+        "message_id": message_id,
 
-        return False
+        "sender": sender,
 
-    try:
+        "subject": subject,
 
-        # ----------------------------------------------------
-        # Crear mensaje
-        # ----------------------------------------------------
+        "date": date,
 
-        message = MIMEMultipart()
+        "actions": actions,
 
-        message["From"] = GMAIL_USER
-        message["To"] = NOTIFY_EMAIL
-        message["Subject"] = subject
+        "error": error
+    }
 
-        message.attach(
-            MIMEText(
-                body,
-                "plain",
-                "utf-8"
-            )
-        )
 
-        # ----------------------------------------------------
-        # Conectar con Gmail SMTP mediante SSL
-        # ----------------------------------------------------
+# ============================================================
+# PROCESAR CORREO
+# ============================================================
 
-        with smtplib.SMTP_SSL(
-            SMTP_SERVER,
-            SMTP_PORT
-        ) as smtp:
+def process_email(
+    mail,
+    email_uid
+):
+    """
+    Lee un correo mediante UID y lo transforma en una señal.
 
-            smtp.login(
-                GMAIL_USER,
-                GMAIL_APP_PASSWORD
-            )
+    IMPORTANTE:
 
-            smtp.sendmail(
-                GMAIL_USER,
-                NOTIFY_EMAIL,
-                message.as_string()
-            )
+    - No ejecuta IBKR.
+    - No marca el correo como leído.
+    - Registra el estado local de la señal.
+    """
 
-        print(
-            "Notificación enviada correctamente."
-        )
+    # --------------------------------------------------------
+    # Obtener mensaje mediante UID.
+    # --------------------------------------------------------
 
-        return True
+    status, msg_data = mail.uid(
+        "fetch",
+        email_uid,
+        "(RFC822)"
+    )
 
-    except Exception as error:
+    if status != "OK":
 
         print()
         print(
-            "ERROR AL ENVIAR NOTIFICACIÓN"
+            "ERROR: no se pudo leer "
+            "el correo."
+        )
+
+        return None
+
+    # --------------------------------------------------------
+    # Extraer mensaje MIME.
+    # --------------------------------------------------------
+
+    for response_part in msg_data:
+
+        if not isinstance(
+            response_part,
+            tuple
+        ):
+
+            continue
+
+        msg = email.message_from_bytes(
+            response_part[1]
+        )
+
+        # ----------------------------------------------------
+        # DATOS DEL CORREO
+        # ----------------------------------------------------
+
+        sender = decode_mime_header(
+            msg.get("From")
+        )
+
+        subject = decode_mime_header(
+            msg.get("Subject")
+        )
+
+        date = msg.get(
+            "Date"
+        )
+
+        # ----------------------------------------------------
+        # MESSAGE-ID
+        # ----------------------------------------------------
+
+        message_id = msg.get(
+            "Message-ID"
+        )
+
+        if message_id:
+
+            message_id = (
+                message_id.strip()
+            )
+
+        else:
+
+            # Fallback.
+            message_id = (
+                "imap_uid:"
+                f"{email_uid.decode(errors='replace')}"
+            )
+
+        # ----------------------------------------------------
+        # UID
+        # ----------------------------------------------------
+
+        email_uid_text = (
+            email_uid.decode(
+                errors="replace"
+            )
+        )
+
+        # ----------------------------------------------------
+        # INFORMACIÓN
+        # ----------------------------------------------------
+
+        print()
+        print(
+            "----------------------------------------"
         )
 
         print(
-            f"Tipo:    {type(error).__name__}"
+            f"UID:        {email_uid_text}"
         )
 
         print(
-            f"Mensaje: {error}"
+            f"Message-ID: {message_id}"
         )
 
-        return False
+        print(
+            f"Remitente:  {sender}"
+        )
+
+        print(
+            f"Asunto:     {subject}"
+        )
+
+        print(
+            f"Fecha:       {date}"
+        )
+
+        print(
+            "----------------------------------------"
+        )
+
+        # ====================================================
+        # COMPROBAR ESTADO PREVIO
+        # ====================================================
+
+        existing_status = (
+            get_existing_signal_status(
+                message_id
+            )
+        )
+
+        if existing_status is not None:
+
+            print()
+            print(
+                ">>> SEÑAL YA REGISTRADA <<<"
+            )
+
+            print(
+                f"Estado: "
+                f"{existing_status}"
+            )
+
+            print(
+                "No se volverá a ejecutar."
+            )
+
+            # ------------------------------------------------
+            # Devolvemos igualmente los metadatos si la señal
+            # estaba REJECTED.
+            #
+            # Esto permite que bot_auto.py pueda decidir
+            # posteriormente si debe notificar/marcar el correo.
+            # ------------------------------------------------
+
+            if existing_status == REJECTED:
+
+                return build_signal(
+                    email_uid_text,
+                    message_id,
+                    sender,
+                    subject,
+                    date,
+                    [],
+                    False,
+                    REJECTED,
+                    "Señal no reconocida."
+                )
+
+            return None
+
+        # ====================================================
+        # PARSER
+        # ====================================================
+
+        actions = parse_signal(
+            subject
+        )
+
+        # ====================================================
+        # SEÑAL NO RECONOCIDA
+        # ====================================================
+
+        if actions is None:
+
+            print()
+            print(
+                ">>> SEÑAL NO RECONOCIDA <<<"
+            )
+
+            rejection_reason = (
+                "El asunto no contiene "
+                "una combinación de acciones "
+                "válida."
+            )
+
+            # ------------------------------------------------
+            # Registrar REJECTED.
+            # ------------------------------------------------
+
+            state_manager.set_status(
+                message_id,
+                REJECTED,
+
+                email_uid=(
+                    email_uid_text
+                ),
+
+                sender=sender,
+
+                subject=subject,
+
+                date=date,
+
+                actions=[],
+
+                error=rejection_reason
+            )
+
+            print(
+                "Estado guardado: REJECTED"
+            )
+
+            # ------------------------------------------------
+            # Devolver la señal rechazada.
+            #
+            # bot_auto.py será responsable de:
+            #
+            #   REJECTED
+            #      ↓
+            #   notifier
+            #      ↓
+            #   marcar leído
+            #
+            # Aquí NO se marca el correo.
+            # ------------------------------------------------
+
+            return build_signal(
+                email_uid_text,
+                message_id,
+                sender,
+                subject,
+                date,
+                [],
+                False,
+                REJECTED,
+                rejection_reason
+            )
+
+        # ====================================================
+        # CREAR SEÑAL VÁLIDA
+        # ====================================================
+
+        signal = build_signal(
+            email_uid_text,
+            message_id,
+            sender,
+            subject,
+            date,
+            actions,
+            True,
+            NEW,
+            None
+        )
+
+        # ====================================================
+        # REGISTRAR COMO NEW
+        # ====================================================
+        #
+        # NO utilizamos PROCESSING aquí.
+        #
+        # bot_auto.py cambia:
+        #
+        # NEW → PROCESSING
+        #
+        # justo antes de ejecutar.
+        # ====================================================
+
+        state_manager.set_status(
+            message_id,
+            NEW,
+
+            email_uid=(
+                email_uid_text
+            ),
+
+            sender=sender,
+
+            subject=subject,
+
+            date=date,
+
+            actions=actions,
+
+            valid=True,
+
+            error=None
+        )
+
+        # ====================================================
+        # MOSTRAR SEÑAL
+        # ====================================================
+
+        print()
+        print(
+            ">>> SEÑAL NUEVA <<<"
+        )
+
+        print(
+            f"Message-ID: "
+            f"{message_id}"
+        )
+
+        print(
+            f"UID:        "
+            f"{email_uid_text}"
+        )
+
+        print(
+            f"Acciones:   "
+            f"{actions}"
+        )
+
+        print(
+            "Estado:     NEW"
+        )
+
+        for action in actions:
+
+            print(
+                f"  → {action}"
+            )
+
+        print(
+            "----------------------------------------"
+        )
+
+        return signal
+
+    return None
+
+
+# ============================================================
+# BUSCAR CORREOS NO LEÍDOS
+# ============================================================
+
+def get_unread_signal_emails(
+    mail
+):
+    """
+    Busca exclusivamente:
+
+        FROM operativadax@gmail.com
+        UNSEEN
+
+    y devuelve UIDs IMAP.
+    """
+
+    status, data = mail.uid(
+        "search",
+        None,
+        f'FROM "{SIGNAL_SENDER}" UNSEEN'
+    )
+
+    if status != "OK":
+
+        print()
+        print(
+            "ERROR: no se pudieron buscar "
+            "los correos."
+        )
+
+        return []
+
+    return data[0].split()
 
 
 # ============================================================
@@ -251,22 +580,36 @@ def send_notification(
 
 def main():
 
-    print("========================================")
-    print("       DAX BOT - EMAIL READER")
-    print("========================================")
+    print(
+        "========================================"
+    )
+
+    print(
+        "       DAX BOT - EMAIL READER"
+    )
+
+    print(
+        "========================================"
+    )
 
     # --------------------------------------------------------
-    # COMPROBAR CONFIGURACIÓN
+    # CONFIGURACIÓN
     # --------------------------------------------------------
 
     if not GMAIL_USER:
 
-        print("ERROR: falta GMAIL_USER")
+        print(
+            "ERROR: falta GMAIL_USER"
+        )
+
         return
 
     if not GMAIL_APP_PASSWORD:
 
-        print("ERROR: falta GMAIL_APP_PASSWORD")
+        print(
+            "ERROR: falta GMAIL_APP_PASSWORD"
+        )
+
         return
 
     print(
@@ -285,16 +628,14 @@ def main():
         f"Remitente:     {SIGNAL_SENDER}"
     )
 
-    print(
-        f"Notificaciones: {NOTIFY_EMAIL}"
-    )
-
     print()
+
+    mail = None
 
     try:
 
         # ----------------------------------------------------
-        # CONEXIÓN IMAP
+        # CONEXIÓN
         # ----------------------------------------------------
 
         print(
@@ -324,20 +665,19 @@ def main():
         )
 
         # ----------------------------------------------------
-        # SELECCIONAR INBOX
+        # INBOX
         # ----------------------------------------------------
 
-        status, data = mail.select(
+        status, _ = mail.select(
             "INBOX"
         )
 
         if status != "OK":
 
             print(
-                "ERROR: no se pudo abrir INBOX."
+                "ERROR: no se pudo abrir "
+                "INBOX."
             )
-
-            mail.logout()
 
             return
 
@@ -346,203 +686,119 @@ def main():
         )
 
         # ----------------------------------------------------
-        # BUSCAR CORREOS DEL PROVEEDOR
+        # BUSCAR CORREOS
         # ----------------------------------------------------
 
         print()
 
         print(
-            f"Buscando correos de "
-            f"{SIGNAL_SENDER}..."
+            f"Buscando correos NO LEÍDOS "
+            f"de {SIGNAL_SENDER}..."
         )
 
-        status, data = mail.search(
-            None,
-            f'FROM "{SIGNAL_SENDER}"'
-        )
-
-        if status != "OK":
-
-            print(
-                "ERROR: no se pudieron buscar "
-                "los correos."
+        email_uids = (
+            get_unread_signal_emails(
+                mail
             )
-
-            mail.logout()
-
-            return
-
-        email_ids = data[0].split()
-
-        print(
-            f"Correos encontrados: "
-            f"{len(email_ids)}"
         )
 
-        if not email_ids:
+        if not email_uids:
 
             print()
 
             print(
-                "No se encontraron correos "
-                f"de {SIGNAL_SENDER}."
+                "No hay señales nuevas."
             )
-
-            mail.logout()
 
             return
 
         # ----------------------------------------------------
-        # ÚLTIMOS CORREOS
+        # RESUMEN
         # ----------------------------------------------------
 
-        latest_ids = email_ids[-MAX_EMAILS:]
+        print()
+
+        print(
+            f"Correos no leídos encontrados: "
+            f"{len(email_uids)}"
+        )
 
         print()
-        print(
-            "========================================"
-        )
-        print(
-            "SEÑALES DETECTADAS"
-        )
+
         print(
             "========================================"
         )
 
-        for email_id in reversed(
-            latest_ids
-        ):
+        print(
+            "PROCESANDO SEÑALES"
+        )
 
-            status, msg_data = mail.fetch(
-                email_id,
-                "(RFC822)"
+        print(
+            "========================================"
+        )
+
+        valid_signals = []
+
+        rejected_signals = []
+
+        # ----------------------------------------------------
+        # Procesar en orden.
+        # ----------------------------------------------------
+
+        for email_uid in email_uids:
+
+            print()
+
+            print(
+                "========================================"
             )
 
-            if status != "OK":
+            print(
+                f"Procesando UID: "
+                f"{email_uid.decode(errors='replace')}"
+            )
 
-                print(
-                    "No se pudo leer el correo."
-                )
+            print(
+                "========================================"
+            )
+
+            signal = process_email(
+                mail,
+                email_uid
+            )
+
+            if signal is None:
 
                 continue
 
-            for response_part in msg_data:
+            # ------------------------------------------------
+            # Señal válida.
+            # ------------------------------------------------
 
-                if not isinstance(
-                    response_part,
-                    tuple
-                ):
+            if signal.get(
+                "valid",
+                False
+            ):
 
-                    continue
-
-                msg = email.message_from_bytes(
-                    response_part[1]
+                valid_signals.append(
+                    signal
                 )
 
-                # --------------------------------------------
-                # DATOS DEL CORREO
-                # --------------------------------------------
+            # ------------------------------------------------
+            # Señal rechazada.
+            # ------------------------------------------------
 
-                sender = decode_mime_header(
-                    msg.get("From")
+            elif signal.get(
+                "status"
+            ) == REJECTED:
+
+                rejected_signals.append(
+                    signal
                 )
 
-                subject = decode_mime_header(
-                    msg.get("Subject")
-                )
-
-                date = msg.get("Date")
-
-                # --------------------------------------------
-                # MOSTRAR CORREO
-                # --------------------------------------------
-
-                print()
-
-                print(
-                    "----------------------------------------"
-                )
-
-                print(
-                    f"Remitente: {sender}"
-                )
-
-                print(
-                    f"Asunto:    {subject}"
-                )
-
-                print(
-                    f"Fecha:     {date}"
-                )
-
-                print(
-                    "----------------------------------------"
-                )
-
-                # --------------------------------------------
-                # PARSER
-                # --------------------------------------------
-
-                actions = parse_signal(
-                    subject
-                )
-
-                if actions is None:
-
-                    print(
-                        ">>> SEÑAL NO RECONOCIDA <<<"
-                    )
-
-                else:
-
-                    print(
-                        ">>> SEÑAL DETECTADA <<<"
-                    )
-
-                    for action in actions:
-
-                        print(
-                            f"- {action}"
-                        )
-
-                    # ------------------------------------------------
-                    # IMPORTANTE - TODAVÍA NO ENVIAMOS NOTIFICACIÓN
-                    # DE "SEÑAL REALIZADA".
-                    #
-                    # En este momento únicamente hemos detectado
-                    # la señal. Todavía NO hemos enviado ninguna
-                    # orden a IBKR.
-                    #
-                    # Cuando conectemos paper_executor.py:
-                    #
-                    # 1. Parsearemos la señal.
-                    # 2. Comprobaremos la posición actual.
-                    # 3. Ejecutaremos la orden.
-                    # 4. Esperaremos "Filled".
-                    # 5. Obtendremos el precio REAL de ejecución.
-                    # 6. Comprobaremos la posición final.
-                    # 7. Entonces llamaremos a:
-                    #
-                    # send_notification(
-                    #     "Señal realizada",
-                    #     cuerpo_del_informe
-                    # )
-                    #
-                    # Si IBKR devuelve un error:
-                    #
-                    # send_notification(
-                    #     "FALLO - Señal no realizada",
-                    #     cuerpo_del_error
-                    # )
-                    #
-                    # Para cambios de posición como:
-                    #
-                    # Cierro Largos y Abro Cortos
-                    #
-                    # solo enviaremos "Señal realizada" cuando
-                    # LAS DOS operaciones estén confirmadas.
-                    #
-                    # ------------------------------------------------
+        # ====================================================
+        # RESUMEN
+        # ====================================================
 
         print()
 
@@ -551,21 +807,113 @@ def main():
         )
 
         print(
-            "Procesamiento finalizado."
+            "RESUMEN"
         )
 
         print(
             "========================================"
         )
 
-        # ----------------------------------------------------
-        # CERRAR CONEXIÓN IMAP
-        # ----------------------------------------------------
-
-        mail.logout()
+        print(
+            f"Señales válidas:   "
+            f"{len(valid_signals)}"
+        )
 
         print(
-            "Conexión cerrada correctamente."
+            f"Señales rechazadas:"
+            f" {len(rejected_signals)}"
+        )
+
+        # ----------------------------------------------------
+        # VÁLIDAS
+        # ----------------------------------------------------
+
+        for index, signal in enumerate(
+            valid_signals,
+            start=1
+        ):
+
+            print()
+
+            print(
+                f"SEÑAL VÁLIDA {index}"
+            )
+
+            print(
+                f"Message-ID: "
+                f"{signal['message_id']}"
+            )
+
+            print(
+                f"UID:        "
+                f"{signal['email_uid']}"
+            )
+
+            print(
+                f"Asunto:     "
+                f"{signal['subject']}"
+            )
+
+            print(
+                f"Acciones:   "
+                f"{signal['actions']}"
+            )
+
+            print(
+                "Estado:     NEW"
+            )
+
+        # ----------------------------------------------------
+        # RECHAZADAS
+        # ----------------------------------------------------
+
+        for index, signal in enumerate(
+            rejected_signals,
+            start=1
+        ):
+
+            print()
+
+            print(
+                f"SEÑAL RECHAZADA {index}"
+            )
+
+            print(
+                f"Message-ID: "
+                f"{signal['message_id']}"
+            )
+
+            print(
+                f"UID:        "
+                f"{signal['email_uid']}"
+            )
+
+            print(
+                f"Asunto:     "
+                f"{signal['subject']}"
+            )
+
+            print(
+                f"Motivo:     "
+                f"{signal.get('error', 'N/A')}"
+            )
+
+            print(
+                "Estado:     REJECTED"
+            )
+
+        print()
+
+        print(
+            "Los correos siguen SIN LEER."
+        )
+
+        print(
+            "No se ha ejecutado ninguna orden."
+        )
+
+        print(
+            "========================================"
         )
 
     except Exception as error:
@@ -585,12 +933,30 @@ def main():
         )
 
         print(
-            f"Tipo:    {type(error).__name__}"
+            f"Tipo:    "
+            f"{type(error).__name__}"
         )
 
         print(
-            f"Mensaje: {error}"
+            f"Mensaje: "
+            f"{error}"
         )
+
+    finally:
+
+        if mail is not None:
+
+            try:
+
+                mail.logout()
+
+                print(
+                    "Conexión cerrada correctamente."
+                )
+
+            except Exception:
+
+                pass
 
 
 # ============================================================
