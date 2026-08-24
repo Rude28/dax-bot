@@ -1,7 +1,10 @@
 import imaplib
 import os
+import smtplib
 import threading
 import time
+
+from email.mime.text import MIMEText
 
 from dotenv import load_dotenv
 
@@ -27,12 +30,45 @@ from signal_state import (
 
 from notifier import send_notification
 
+from logger import (
+    log_info,
+    log_warning,
+    log_error,
+)
+
+from bot_state import (
+    bot_state,
+    STARTING,
+    CONNECTED,
+    READY,
+    PROCESSING_SIGNAL,
+    RECONNECTING_IBKR,
+    RECONNECTING_GMAIL,
+    SAFETY_LOCK,
+    STOPPING,
+)
+
+from control_email import (
+    get_control_emails,
+    read_control_email,
+    mark_control_as_read,
+)
+
+from control_executor import (
+    ControlExecutor,
+)
+
 
 # ============================================================
 # CONFIGURACIÓN
 # ============================================================
 
 load_dotenv()
+
+
+# ============================================================
+# GMAIL
+# ============================================================
 
 GMAIL_USER = os.getenv(
     "GMAIL_USER"
@@ -54,15 +90,55 @@ IMAP_PORT = int(
     )
 )
 
+
+# ============================================================
+# IBKR
+# ============================================================
+
 IB_HOST = "127.0.0.1"
 IB_PORT = 4002
 IB_CLIENT_ID = 4
+
+
+# ============================================================
+# PROVEEDOR DE SEÑALES
+# ============================================================
 
 SIGNAL_SENDER = (
     "operativadax@gmail.com"
 )
 
+
+# ============================================================
+# CORREO DE CONTROL
+# ============================================================
+
+CONTROL_RESPONSE_TO = os.getenv(
+    "CONTROL_EMAIL"
+)
+
+SMTP_SERVER = os.getenv(
+    "SMTP_SERVER",
+    "smtp.gmail.com"
+)
+
+SMTP_PORT = int(
+    os.getenv(
+        "SMTP_PORT",
+        "465"
+    )
+)
+
+
+# ============================================================
+# INTERVALO DE COMPROBACIÓN
+# ============================================================
+
 CHECK_INTERVAL = 10
+IBKR_RECONNECT_INTERVAL = 5
+IBKR_RECONNECT_TIMEOUT = 10
+GMAIL_RECONNECT_INTERVAL = 5
+GMAIL_RECONNECT_TIMEOUT = 10
 
 
 # ============================================================
@@ -71,12 +147,18 @@ CHECK_INTERVAL = 10
 
 state_manager = SignalState()
 
+bot_state.mark_started()
+bot_state.set_status(STARTING)
+
 
 # ============================================================
 # CONECTAR IBKR
 # ============================================================
 
 def create_ib_executor():
+
+    bot_state.set_status(STARTING)
+    bot_state.set_ibkr_connected(False)
 
     print()
     print(
@@ -110,6 +192,11 @@ def create_ib_executor():
         timeout=10
     ):
 
+        log_error(
+            "No se pudo conectar con IB Gateway."
+        )
+
+        print()
         print(
             "ERROR: no se pudo conectar "
             "con IB Gateway."
@@ -123,6 +210,13 @@ def create_ib_executor():
         "Conexión IBKR establecida."
     )
 
+    log_info(
+        "Conexión con IBKR establecida."
+    )
+
+    bot_state.set_ibkr_connected(True)
+    bot_state.set_status(CONNECTED)
+
     print(
         "Esperando posiciones iniciales..."
     )
@@ -131,6 +225,11 @@ def create_ib_executor():
         timeout=10
     ):
 
+        log_error(
+            "No se recibieron las posiciones iniciales de IBKR."
+        )
+
+        print()
         print(
             "ERROR: no se recibieron "
             "las posiciones."
@@ -149,6 +248,13 @@ def create_ib_executor():
         f"Posición FDXM: "
         f"{app.get_position()}"
     )
+
+    log_info(
+        f"Posición inicial FDXM: "
+        f"{app.get_position()}"
+    )
+
+    bot_state.set_position(app.get_position())
 
     return app
 
@@ -196,7 +302,680 @@ def create_mail_connection():
         "Gmail preparado correctamente."
     )
 
+    log_info(
+        "Conexión Gmail establecida."
+    )
+
+    bot_state.set_gmail_connected(True)
+
     return mail
+
+
+# ============================================================
+# RECONEXIÓN GMAIL
+# ============================================================
+
+def reconnect_gmail(
+    mail,
+    ib_app
+):
+    """
+    Recupera la conexión IMAP de Gmail de forma segura.
+
+    Durante la reconexión no se procesan señales.
+    Se crea una conexión nueva, se autentica y se selecciona INBOX
+    antes de volver al estado READY.
+    """
+
+    attempt = 0
+
+    while True:
+
+        attempt += 1
+
+        bot_state.set_status(
+            RECONNECTING_GMAIL
+        )
+
+        bot_state.set_gmail_connected(
+            False
+        )
+
+        print()
+        print(
+            "========================================"
+        )
+        print(
+            "RECONEXIÓN GMAIL"
+        )
+        print(
+            f"Intento: {attempt}"
+        )
+        print(
+            "========================================"
+        )
+
+        log_warning(
+            f"Intentando reconectar Gmail | Intento={attempt}"
+        )
+
+        try:
+
+            if mail is not None:
+
+                try:
+                    mail.logout()
+                except Exception:
+                    pass
+
+            new_mail = imaplib.IMAP4_SSL(
+                IMAP_SERVER,
+                IMAP_PORT,
+                timeout=GMAIL_RECONNECT_TIMEOUT
+            )
+
+            new_mail.login(
+                GMAIL_USER,
+                GMAIL_APP_PASSWORD
+            )
+
+            status, _ = new_mail.select(
+                "INBOX"
+            )
+
+            if status != "OK":
+                raise RuntimeError(
+                    "No se pudo abrir INBOX tras reconectar Gmail."
+                )
+
+            # Verificación explícita de que IMAP responde.
+            noop_status, _ = new_mail.noop()
+
+            if noop_status != "OK":
+                raise RuntimeError(
+                    "Gmail respondió incorrectamente al NOOP."
+                )
+
+            bot_state.set_gmail_connected(True)
+
+            # Antes de READY comprobamos que IBKR sigue conectado.
+            if not ib_app.is_connected():
+
+                log_warning(
+                    "Gmail reconectado pero IBKR no está conectado. Se mantiene estado de reconexión."
+                )
+
+                try:
+                    new_mail.logout()
+                except Exception:
+                    pass
+
+                bot_state.set_gmail_connected(False)
+                time.sleep(GMAIL_RECONNECT_INTERVAL)
+                continue
+
+            # Si existe PROCESSING, no reanudamos directamente la lectura
+            # de nuevas señales. Primero reconciliamos.
+            processing = state_manager.get_processing_signals()
+
+            if processing:
+
+                print()
+                print(
+                    "PROCESSING DETECTADO TRAS RECONEXIÓN DE GMAIL."
+                )
+
+                log_warning(
+                    f"PROCESSING tras reconexión Gmail | Cantidad={len(processing)}"
+                )
+
+                if not reconcile_processing_signals(
+                    ib_app,
+                    new_mail
+                ):
+
+                    bot_state.set_status(
+                        SAFETY_LOCK
+                    )
+
+                    log_error(
+                        "No se pudo reconciliar PROCESSING tras reconexión Gmail."
+                    )
+
+                    return None
+
+            bot_state.set_position(
+                ib_app.get_position()
+            )
+
+            bot_state.set_status(
+                READY
+            )
+
+            log_info(
+                f"Gmail reconectado y validado | Position={ib_app.get_position()}"
+            )
+
+            print()
+            print(
+                "GMAIL RECONECTADO CORRECTAMENTE."
+            )
+
+            return new_mail
+
+        except Exception as error:
+
+            bot_state.set_error(
+                error
+            )
+
+            log_warning(
+                f"Error reconectando Gmail | Intento={attempt} | "
+                f"{type(error).__name__}: {error}"
+            )
+
+            time.sleep(
+                GMAIL_RECONNECT_INTERVAL
+            )
+
+
+# ============================================================
+# COMPROBAR CONEXIÓN GMAIL
+# ============================================================
+
+def ensure_gmail_connection(
+    mail,
+    ib_app
+):
+    """Comprueba IMAP y reconecta si la conexión no responde."""
+
+    try:
+
+        status, _ = mail.noop()
+
+        if status != "OK":
+            raise RuntimeError(
+                "IMAP NOOP devolvió un estado no OK."
+            )
+
+        if not ib_app.is_connected():
+            return mail
+
+        return mail
+
+    except Exception as error:
+
+        bot_state.set_gmail_connected(False)
+        bot_state.set_error(error)
+        log_warning(
+            f"Gmail desconectado detectado | "
+            f"{type(error).__name__}: {error}"
+        )
+
+        print()
+        print(
+            "GMAIL DESCONECTADO."
+        )
+        print(
+            "No se procesarán señales hasta reconectar."
+        )
+
+        return reconnect_gmail(
+            mail,
+            ib_app
+        )
+
+
+# ============================================================
+# RECONEXIÓN IBKR
+# ============================================================
+
+def reconnect_ibkr(
+    app,
+    mail
+):
+    """
+    Intenta recuperar la conexión IBKR de forma segura.
+
+    No permite nuevas órdenes durante la reconexión.
+    Después de reconectar:
+        1. obtiene un nuevo Order ID;
+        2. solicita posiciones reales;
+        3. comprueba PROCESSING;
+        4. reconcilia si es necesario;
+        5. solo entonces vuelve a READY.
+    """
+
+    attempt = 0
+
+    while True:
+
+        attempt += 1
+
+        bot_state.set_status(
+            RECONNECTING_IBKR
+        )
+
+        bot_state.set_ibkr_connected(
+            False
+        )
+
+        print()
+        print(
+            "========================================"
+        )
+        print(
+            "RECONEXIÓN IBKR"
+        )
+        print(
+            f"Intento: {attempt}"
+        )
+        print(
+            "========================================"
+        )
+
+        log_warning(
+            f"Intentando reconectar IBKR | Intento={attempt}"
+        )
+
+        try:
+
+            try:
+                app.disconnect()
+            except Exception:
+                pass
+
+            app.connection_ready.clear()
+            app.positions_ready.clear()
+            app.connection_lost.clear()
+
+            app.connect(
+                IB_HOST,
+                IB_PORT,
+                IB_CLIENT_ID
+            )
+
+            api_thread = threading.Thread(
+                target=app.run,
+                daemon=True
+            )
+
+            app.api_thread = api_thread
+            api_thread.start()
+
+            connected = app.connection_ready.wait(
+                timeout=IBKR_RECONNECT_TIMEOUT
+            )
+
+            if not connected:
+
+                log_warning(
+                    f"Reconexión IBKR sin conexión | Intento={attempt}"
+                )
+
+                time.sleep(
+                    IBKR_RECONNECT_INTERVAL
+                )
+
+                continue
+
+            bot_state.set_ibkr_connected(
+                True
+            )
+
+            if not app.positions_ready.wait(
+                timeout=IBKR_RECONNECT_TIMEOUT
+            ):
+
+                log_warning(
+                    f"Reconexión IBKR sin posiciones iniciales | Intento={attempt}"
+                )
+
+                try:
+                    app.disconnect()
+                except Exception:
+                    pass
+
+                time.sleep(
+                    IBKR_RECONNECT_INTERVAL
+                )
+
+                continue
+
+            current_position = (
+                app.get_position()
+            )
+
+            bot_state.set_position(
+                current_position
+            )
+
+            print()
+            print(
+                "IBKR RECONECTADO CORRECTAMENTE."
+            )
+            print(
+                f"Posición FDXM: {current_position}"
+            )
+
+            log_info(
+                f"IBKR reconectado | "
+                f"Position={current_position} | "
+                f"NextOrderID={app.next_order_id}"
+            )
+
+            # ------------------------------------------------
+            # Reconciliar cualquier PROCESSING antes de volver
+            # a permitir operaciones.
+            # ------------------------------------------------
+
+            processing = (
+                state_manager
+                .get_processing_signals()
+            )
+
+            if processing:
+
+                print()
+                print(
+                    "PROCESSING DETECTADO TRAS RECONEXIÓN."
+                )
+
+                log_warning(
+                    f"PROCESSING tras reconexión | "
+                    f"Cantidad={len(processing)}"
+                )
+
+                if not reconcile_processing_signals(
+                    app,
+                    mail
+                ):
+
+                    bot_state.set_status(
+                        SAFETY_LOCK
+                    )
+
+                    log_error(
+                        "No se pudo reconciliar PROCESSING tras reconexión."
+                    )
+
+                    return False
+
+            bot_state.set_status(
+                READY
+            )
+
+            log_info(
+                "IBKR reconectado y validado. Estado READY."
+            )
+
+            return True
+
+        except Exception as error:
+
+            bot_state.set_error(
+                error
+            )
+
+            log_error(
+                f"Error durante reconexión IBKR | "
+                f"Intento={attempt} | "
+                f"{type(error).__name__}: {error}"
+            )
+
+            time.sleep(
+                IBKR_RECONNECT_INTERVAL
+            )
+
+
+# ============================================================
+# ENVIAR RESPUESTA DE CONTROL
+# ============================================================
+
+def send_control_response(
+    result
+):
+
+    recipient = CONTROL_RESPONSE_TO
+
+    if not recipient:
+
+        log_error(
+            "CONTROL_EMAIL no está configurado; "
+            "no se puede enviar respuesta de control."
+        )
+
+        return False
+
+    subject = result.get(
+        "subject",
+        "DAX BOT - Control"
+    )
+
+    body = result.get(
+        "body",
+        ""
+    )
+
+    message = MIMEText(
+        body,
+        "plain",
+        "utf-8"
+    )
+
+    message["From"] = GMAIL_USER
+    message["To"] = recipient
+    message["Subject"] = subject
+
+    try:
+
+        with smtplib.SMTP_SSL(
+            SMTP_SERVER,
+            SMTP_PORT
+        ) as smtp:
+
+            smtp.login(
+                GMAIL_USER,
+                GMAIL_APP_PASSWORD
+            )
+
+            smtp.sendmail(
+                GMAIL_USER,
+                recipient,
+                message.as_string()
+            )
+
+        log_info(
+            f"Respuesta de control enviada | "
+            f"Subject={subject}"
+        )
+
+        print(
+            f"Respuesta de control enviada: {subject}"
+        )
+
+        return True
+
+    except Exception as error:
+
+        log_error(
+            f"Error enviando respuesta de control | "
+            f"{type(error).__name__}: {error}"
+        )
+
+        return False
+
+
+# ============================================================
+# PROCESAR CONTROL
+# ============================================================
+
+def process_control_messages(
+    mail,
+    control_executor
+):
+    """
+    Procesa únicamente consultas de control.
+
+    En esta fase: 
+        STATUS      -> activo
+        POSITIONS   -> activo
+        ACCOUNT     -> activo si PaperExecutor dispone de
+                       la capa AccountSummary.
+
+    Las órdenes manuales se reconocen, pero todavía no se
+    ejecutan desde bot_auto.
+    """
+
+    control_uids = get_control_emails(
+        mail
+    )
+
+    if not control_uids:
+
+        return True
+
+    for email_uid in control_uids:
+
+        control = read_control_email(
+            mail,
+            email_uid
+        )
+
+        if control is None:
+            continue
+
+        if not control.get(
+            "valid",
+            False
+        ):
+
+            result = {
+                "subject": "DAX BOT - Control rechazado",
+                "body": (
+                    "COMANDO DE CONTROL RECHAZADO\n\n"
+                    f"Motivo: {control.get('reason', 'Desconocido')}\n\n"
+                    "No se ha realizado ninguna operación."
+                )
+            }
+
+            send_control_response(
+                result
+            )
+
+            mark_control_as_read(
+                mail,
+                email_uid
+            )
+
+            continue
+
+        command_type = control.get(
+            "command_type"
+        )
+
+        command = control.get(
+            "command"
+        )
+
+        # ----------------------------------------------------
+        # Consultas
+        # ----------------------------------------------------
+
+        if command_type == "COMMAND" and command in (
+            "STATUS",
+            "POSITIONS",
+            "ACCOUNT",
+        ):
+
+            result = control_executor.execute(
+                command
+            )
+
+            send_control_response(
+                result
+            )
+
+            mark_control_as_read(
+                mail,
+                email_uid
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # Operaciones manuales todavía no activadas en bot_auto
+        # ----------------------------------------------------
+
+        if command_type == "COMMAND" and command in (
+            "OPEN LONG",
+            "CLOSE LONG",
+            "OPEN SHORT",
+            "CLOSE SHORT",
+        ):
+
+            result = {
+                "subject": "DAX BOT - Control manual",
+                "body": (
+                    "OPERACIÓN MANUAL RECIBIDA\n\n"
+                    f"Solicitud: {command}\n\n"
+                    "Las operaciones manuales por correo "
+                    "todavía no están habilitadas en bot_auto.\n\n"
+                    "No se ha enviado ninguna orden."
+                )
+            }
+
+            log_warning(
+                f"Operación manual recibida pero no activada | "
+                f"Command={command} | "
+                f"Message-ID={control.get('message_id')}"
+            )
+
+            send_control_response(
+                result
+            )
+
+            mark_control_as_read(
+                mail,
+                email_uid
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # Confirmación todavía no activada
+        # ----------------------------------------------------
+
+        if command_type == "CONFIRM":
+
+            result = {
+                "subject": "DAX BOT - Confirmación no activa",
+                "body": (
+                    "CONFIRMACIÓN RECIBIDA\n\n"
+                    f"Código: {control.get('code')}\n\n"
+                    "La ejecución manual por correo todavía "
+                    "no está habilitada en bot_auto.\n\n"
+                    "No se ha enviado ninguna orden."
+                )
+            }
+
+            log_warning(
+                f"Confirmación recibida pero no activada | "
+                f"Code={control.get('code')}"
+            )
+
+            send_control_response(
+                result
+            )
+
+            mark_control_as_read(
+                mail,
+                email_uid
+            )
+
+            continue
+
+    return True
 
 
 # ============================================================
@@ -230,6 +1009,11 @@ def mark_as_read(
             "como leído."
         )
 
+        log_warning(
+            f"No se pudo marcar correo como leído | "
+            f"UID={email_uid}"
+        )
+
         return False
 
     except Exception as error:
@@ -237,6 +1021,12 @@ def mark_as_read(
         print(
             f"ERROR marcando correo como leído: "
             f"{error}"
+        )
+
+        log_error(
+            f"Error marcando correo como leído | "
+            f"UID={email_uid} | "
+            f"{type(error).__name__}: {error}"
         )
 
         return False
@@ -433,6 +1223,10 @@ def reconcile_processing_signals(
             "No hay señales PROCESSING pendientes."
         )
 
+        log_info(
+            "No hay señales PROCESSING pendientes."
+        )
+
         return True
 
     print()
@@ -446,6 +1240,11 @@ def reconcile_processing_signals(
 
     print(
         "########################################"
+    )
+
+    log_warning(
+        f"Se detectaron {len(processing_signals)} "
+        f"señales PROCESSING."
     )
 
     for message_id, state in (
@@ -471,6 +1270,12 @@ def reconcile_processing_signals(
             f"{state.get('actions')}"
         )
 
+        log_info(
+            f"Reconciliando PROCESSING | "
+            f"Message-ID={message_id} | "
+            f"Actions={state.get('actions')}"
+        )
+
         operations = state.get(
             "operations",
             []
@@ -484,6 +1289,11 @@ def reconcile_processing_signals(
 
             print(
                 "NO es seguro continuar."
+            )
+
+            log_error(
+                f"PROCESSING sin operaciones guardadas | "
+                f"Message-ID={message_id}"
             )
 
             return False
@@ -525,6 +1335,11 @@ def reconcile_processing_signals(
                     "NO se reanudará automáticamente."
                 )
 
+                log_error(
+                    f"PROCESSING incompleto entre operaciones | "
+                    f"Message-ID={message_id}"
+                )
+
                 return False
 
             continue
@@ -546,6 +1361,11 @@ def reconcile_processing_signals(
                 "NO es seguro reconciliar."
             )
 
+            log_error(
+                f"Más de una operación pendiente | "
+                f"Message-ID={message_id}"
+            )
+
             return False
 
         pending = (
@@ -564,6 +1384,11 @@ def reconcile_processing_signals(
 
             print(
                 "NO es seguro continuar."
+            )
+
+            log_error(
+                f"PROCESSING sin Order ID | "
+                f"Message-ID={message_id}"
             )
 
             return False
@@ -605,6 +1430,12 @@ def reconcile_processing_signals(
                 "BOT BLOQUEADO."
             )
 
+            log_error(
+                f"Orden PROCESSING todavía abierta | "
+                f"Message-ID={message_id} | "
+                f"OrderID={order_id}"
+            )
+
             return False
 
         # ----------------------------------------------------
@@ -633,6 +1464,12 @@ def reconcile_processing_signals(
                 "BOT BLOQUEADO."
             )
 
+            log_error(
+                f"Orden UNKNOWN durante recuperación | "
+                f"Message-ID={message_id} | "
+                f"OrderID={order_id}"
+            )
+
             return False
 
         # ----------------------------------------------------
@@ -651,6 +1488,13 @@ def reconcile_processing_signals(
                 "NO se resolverá automáticamente."
             )
 
+            log_warning(
+                f"Orden recuperada no Filled | "
+                f"Message-ID={message_id} | "
+                f"OrderID={order_id} | "
+                f"Status={status}"
+            )
+
             return False
 
         # ----------------------------------------------------
@@ -666,6 +1510,13 @@ def reconcile_processing_signals(
             print(
                 "La orden no tiene una ejecución "
                 "completa."
+            )
+
+            log_error(
+                f"Cantidad recuperada incompleta | "
+                f"Message-ID={message_id} | "
+                f"OrderID={order_id} | "
+                f"Filled={reconciliation.get('filled', 0.0)}"
             )
 
             return False
@@ -717,6 +1568,13 @@ def reconcile_processing_signals(
             recovered_result
         )
 
+        log_info(
+            f"Operación recuperada | "
+            f"Message-ID={message_id} | "
+            f"OrderID={order_id} | "
+            f"Price={recovered_result.get('price')}"
+        )
+
         refreshed_state = (
             state_manager.get(
                 message_id
@@ -761,6 +1619,11 @@ def reconcile_processing_signals(
                 "NO se reanudará automáticamente."
             )
 
+            log_warning(
+                f"Recuperación incompleta de secuencia | "
+                f"Message-ID={message_id}"
+            )
+
             return False
 
         expected_final_position = (
@@ -782,6 +1645,11 @@ def reconcile_processing_signals(
                 "No existe posición final esperada."
             )
 
+            log_error(
+                f"Sin posición final esperada | "
+                f"Message-ID={message_id}"
+            )
+
             return False
 
         if actual_position != (
@@ -801,6 +1669,13 @@ def reconcile_processing_signals(
             print(
                 f"Real: "
                 f"{actual_position}"
+            )
+
+            log_error(
+                f"POSITION_MISMATCH durante recuperación | "
+                f"Message-ID={message_id} | "
+                f"Expected={expected_final_position} | "
+                f"Actual={actual_position}"
             )
 
             return False
@@ -836,6 +1711,13 @@ def reconcile_processing_signals(
             "Estado: SUCCESS"
         )
 
+        log_info(
+            f"Señal recuperada correctamente | "
+            f"Message-ID={message_id} | "
+            f"Estado=SUCCESS | "
+            f"Posición={actual_position}"
+        )
+
         # ----------------------------------------------------
         # Notificación.
         # ----------------------------------------------------
@@ -853,9 +1735,13 @@ def reconcile_processing_signals(
                 "la notificación de recuperación."
             )
 
+            log_warning(
+                f"Falló notificación de recuperación | "
+                f"Message-ID={message_id}"
+            )
+
         # ----------------------------------------------------
-        # El resultado de trading ya está confirmado.
-        # Marcamos leído para evitar duplicación.
+        # Marcar leído.
         # ----------------------------------------------------
 
         mark_as_read(
@@ -867,6 +1753,10 @@ def reconcile_processing_signals(
 
     print()
     print(
+        "Reconciliación PROCESSING completada."
+    )
+
+    log_info(
         "Reconciliación PROCESSING completada."
     )
 
@@ -942,6 +1832,12 @@ def process_rejected_signal(
         "SEÑAL RECHAZADA."
     )
 
+    log_warning(
+        f"Señal REJECTED | "
+        f"Message-ID={signal.get('message_id')} | "
+        f"Subject={signal.get('subject')}"
+    )
+
     notification_sent = (
         send_notification(
             result
@@ -953,6 +1849,11 @@ def process_rejected_signal(
         print(
             "No se pudo enviar la "
             "notificación de rechazo."
+        )
+
+        log_warning(
+            f"No se pudo notificar REJECTED | "
+            f"Message-ID={signal.get('message_id')}"
         )
 
     mark_as_read(
@@ -988,6 +1889,12 @@ def process_valid_signal(
         print(
             f"Estado actual {current_status}; "
             "no se ejecutará."
+        )
+
+        log_warning(
+            f"Señal no ejecutada por estado | "
+            f"Message-ID={message_id} | "
+            f"Status={current_status}"
         )
 
         return
@@ -1054,6 +1961,13 @@ def process_valid_signal(
         "Estado cambiado a PROCESSING."
     )
 
+    log_info(
+        f"Estado PROCESSING | "
+        f"Message-ID={message_id} | "
+        f"InitialPosition={initial_position} | "
+        f"ExpectedFinal={expected_final_position}"
+    )
+
     # --------------------------------------------------------
     # Ejecutar.
     # --------------------------------------------------------
@@ -1066,7 +1980,19 @@ def process_valid_signal(
             )
         )
 
+        log_info(
+            f"Resultado señal | "
+            f"Message-ID={signal.get('message_id')} | "
+            f"Resultado={result}"
+        )
+
     except Exception as error:
+
+        log_error(
+            f"Error durante ejecución de señal | "
+            f"Message-ID={message_id} | "
+            f"{type(error).__name__}: {error}"
+        )
 
         result = {
             "success": False,
@@ -1199,6 +2125,13 @@ def process_valid_signal(
         f"{final_status}"
     )
 
+    log_info(
+        f"Estado final señal | "
+        f"Message-ID={message_id} | "
+        f"Estado={final_status} | "
+        f"Posición={result.get('position')}"
+    )
+
     # --------------------------------------------------------
     # Notificación.
     # --------------------------------------------------------
@@ -1216,18 +2149,13 @@ def process_valid_signal(
             "la notificación."
         )
 
+        log_warning(
+            f"Fallo notificación | "
+            f"Message-ID={message_id}"
+        )
+
     # --------------------------------------------------------
     # Política de correo.
-    #
-    # Una vez que el resultado de trading está guardado,
-    # NO debemos volver a ejecutar la misma señal aunque
-    # el correo permanezca UNSEEN.
-    #
-    # SUCCESS:
-    #     SEEN
-    #
-    # FAILED/PARTIAL:
-    #     UNSEEN para revisión manual
     # --------------------------------------------------------
 
     if final_status == SUCCESS:
@@ -1248,6 +2176,12 @@ def process_valid_signal(
 
         print(
             "El correo permanece SIN LEER."
+        )
+
+        log_warning(
+            f"Correo permanece UNSEEN | "
+            f"Message-ID={message_id} | "
+            f"Estado={final_status}"
         )
 
 
@@ -1278,6 +2212,16 @@ def process_signal(
         mail,
         email_uid
     )
+
+    if signal is not None:
+
+        log_info(
+            f"Correo procesado | "
+            f"Message-ID={signal.get('message_id')} | "
+            f"UID={signal.get('email_uid')} | "
+            f"Acciones={signal.get('actions')} | "
+            f"Estado={signal.get('status')}"
+        )
 
     if signal is None:
 
@@ -1320,6 +2264,9 @@ def process_signal(
 
 def run():
 
+    bot_state.mark_started()
+    bot_state.set_status(STARTING)
+
     print()
     print(
         "========================================"
@@ -1337,6 +2284,10 @@ def run():
         "========================================"
     )
 
+    log_info(
+        "DAX BOT iniciado en modo PAPER."
+    )
+
     # ========================================================
     # IBKR
     # ========================================================
@@ -1346,6 +2297,10 @@ def run():
     )
 
     if ib_app is None:
+
+        log_error(
+            "El bot no pudo iniciar porque IBKR no está disponible."
+        )
 
         return
 
@@ -1375,6 +2330,10 @@ def run():
                 "BOT BLOQUEADO POR SEGURIDAD."
             )
 
+            log_error(
+                "Bot bloqueado durante reconciliación PROCESSING."
+            )
+
             return
 
         # ====================================================
@@ -1386,6 +2345,10 @@ def run():
                 ib_app,
                 state_manager
             )
+        )
+
+        control_executor = ControlExecutor(
+            ib_app
         )
 
         print()
@@ -1439,6 +2402,13 @@ def run():
             "  ✓ Procesamiento secuencial"
         )
 
+        bot_state.set_position(ib_app.get_position())
+        bot_state.set_status(READY)
+
+        log_info(
+            "DAX BOT preparado y listo para recibir señales."
+        )
+
         # ====================================================
         # LOOP
         # ====================================================
@@ -1446,6 +2416,27 @@ def run():
         while True:
 
             try:
+
+                # ------------------------------------------------
+                # Reconexión IBKR
+                # ------------------------------------------------
+
+                if not ib_app.is_trading_connection_ready():
+
+                    log_warning(
+                        "IBKR no está disponible durante el ciclo."
+                    )
+
+                    if not reconnect_ibkr(
+                        ib_app,
+                        mail
+                    ):
+
+                        bot_state.set_status(
+                            SAFETY_LOCK
+                        )
+
+                        return
 
                 # ------------------------------------------------
                 # No operar si aparece PROCESSING.
@@ -1467,17 +2458,101 @@ def run():
                         "El bot se detendrá."
                     )
 
+                    log_error(
+                        f"Señal PROCESSING detectada durante el ciclo | "
+                        f"Cantidad={len(processing)}"
+                    )
+
                     return
+
+                bot_state.set_position(
+                    ib_app.get_position()
+                )
+
+                # ------------------------------------------------
+                # Comprobar Gmail antes de buscar correos.
+                # ------------------------------------------------
+
+                mail = ensure_gmail_connection(
+                    mail,
+                    ib_app
+                )
+
+                if mail is None:
+
+                    print()
+                    print(
+                        "BOT BLOQUEADO POR SEGURIDAD."
+                    )
+
+                    bot_state.set_status(
+                        SAFETY_LOCK
+                    )
+
+                    return
+
+                # ------------------------------------------------
+                # PROCESAR CORREOS DE CONTROL
+                # ------------------------------------------------
+
+                try:
+
+                    if not process_control_messages(
+                        mail,
+                        control_executor
+                    ):
+
+                        bot_state.set_status(
+                            SAFETY_LOCK
+                        )
+
+                        return
+
+                except Exception as error:
+
+                    log_warning(
+                        f"Error procesando control por correo | "
+                        f"{type(error).__name__}: {error}"
+                    )
+
+                    # El fallo de un correo de control no debe bloquear
+                    # automáticamente las señales normales. Si además
+                    # se ha perdido Gmail, ensure_gmail_connection lo
+                    # detectará en el siguiente ciclo.
 
                 # ------------------------------------------------
                 # Buscar correos.
                 # ------------------------------------------------
 
-                email_uids = (
-                    get_unread_signal_emails(
-                        mail
+                try:
+
+                    email_uids = (
+                        get_unread_signal_emails(
+                            mail
+                        )
                     )
-                )
+
+                except Exception as error:
+
+                    log_warning(
+                        f"Error leyendo Gmail durante ciclo | "
+                        f"{type(error).__name__}: {error}"
+                    )
+
+                    mail = reconnect_gmail(
+                        mail,
+                        ib_app
+                    )
+
+                    if mail is None:
+
+                        bot_state.set_status(
+                            SAFETY_LOCK
+                        )
+
+                        return
+
+                    continue
 
                 if not email_uids:
 
@@ -1491,6 +2566,11 @@ def run():
                     print(
                         f"Señales UNSEEN: "
                         f"{len(email_uids)}"
+                    )
+
+                    log_info(
+                        f"Señales UNSEEN encontradas | "
+                        f"Cantidad={len(email_uids)}"
                     )
 
                     for email_uid in (
@@ -1531,6 +2611,12 @@ def run():
                                 "########################################"
                             )
 
+                            log_error(
+                                f"Bot bloqueado | "
+                                f"Existe PROCESSING después de procesar correo | "
+                                f"Cantidad={len(processing)}"
+                            )
+
                             return
 
             except SignalStateError as error:
@@ -1556,6 +2642,10 @@ def run():
                     "EL BOT SE DETIENE."
                 )
 
+                log_error(
+                    f"ERROR CRÍTICO DE ESTADO | {error}"
+                )
+
                 return
 
             except Exception as error:
@@ -1569,6 +2659,19 @@ def run():
                     f"{type(error).__name__}: "
                     f"{error}"
                 )
+
+                log_error(
+                    f"Error en ciclo automático | "
+                    f"{type(error).__name__}: {error}"
+                )
+
+                bot_state.set_error(error)
+                bot_state.set_status(
+                    SAFETY_LOCK,
+                    error=error
+                )
+
+                return
 
             print()
             print(
@@ -1587,6 +2690,10 @@ def run():
             "Interrupción manual recibida."
         )
 
+        log_warning(
+            "DAX BOT interrumpido manualmente."
+        )
+
     finally:
 
         if mail is not None:
@@ -1595,9 +2702,12 @@ def run():
 
                 mail.logout()
 
-            except Exception:
+            except Exception as error:
 
-                pass
+                log_warning(
+                    f"Error cerrando conexión Gmail | "
+                    f"{error}"
+                )
 
         if ib_app is not None:
 
@@ -1605,12 +2715,23 @@ def run():
 
                 ib_app.disconnect()
 
-            except Exception:
+            except Exception as error:
 
-                pass
+                log_warning(
+                    f"Error cerrando conexión IBKR | "
+                    f"{error}"
+                )
+
+        bot_state.set_status(
+            STOPPING
+        )
 
         print()
         print(
+            "DAX BOT detenido."
+        )
+
+        log_info(
             "DAX BOT detenido."
         )
 

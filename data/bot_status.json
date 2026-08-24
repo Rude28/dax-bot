@@ -1,0 +1,13 @@
+{
+    "status": "STARTING",
+    "started_at": "2026-08-24T18:04:03.576574+02:00",
+    "updated_at": "2026-08-24T18:04:03.579182+02:00",
+    "ibkr_connected": false,
+    "gmail_connected": false,
+    "current_message_id": null,
+    "last_signal_status": null,
+    "last_error": null,
+    "last_order_id": null,
+    "last_execution_price": null,
+    "position": 0.0
+}

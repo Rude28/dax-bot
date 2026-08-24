@@ -6,12 +6,23 @@ from email.mime.multipart import MIMEMultipart
 
 from dotenv import load_dotenv
 
+from logger import (
+    log_info,
+    log_warning,
+    log_error,
+)
+
 
 # ============================================================
 # CONFIGURACIÓN
 # ============================================================
 
 load_dotenv()
+
+
+# ============================================================
+# GMAIL
+# ============================================================
 
 GMAIL_USER = os.getenv(
     "GMAIL_USER"
@@ -20,6 +31,11 @@ GMAIL_USER = os.getenv(
 GMAIL_APP_PASSWORD = os.getenv(
     "GMAIL_APP_PASSWORD"
 )
+
+
+# ============================================================
+# SMTP
+# ============================================================
 
 SMTP_SERVER = os.getenv(
     "SMTP_SERVER",
@@ -33,12 +49,10 @@ SMTP_PORT = int(
     )
 )
 
-# ------------------------------------------------------------
-# Destinatario de las notificaciones.
-#
-# Por defecto:
-# la misma cuenta Gmail utilizada por el bot.
-# ------------------------------------------------------------
+
+# ============================================================
+# DESTINATARIO
+# ============================================================
 
 NOTIFY_EMAIL = os.getenv(
     "NOTIFY_EMAIL",
@@ -47,13 +61,12 @@ NOTIFY_EMAIL = os.getenv(
 
 
 # ============================================================
-# UTILIDADES
+# FORMATEAR VALORES
 # ============================================================
 
-def format_number(value):
-    """
-    Formatea números para mostrarlos de forma legible.
-    """
+def format_number(
+    value
+):
 
     if value is None:
         return "N/A"
@@ -81,22 +94,6 @@ def format_number(value):
 def get_notification_type(
     result
 ):
-    """
-    Determina el tipo de notificación.
-
-    success=True
-        -> Señal realizada
-
-    success=False y alguna operación Filled
-        -> Ejecución parcial
-
-    success=False y ninguna operación Filled
-        -> Fallo - señal no realizada
-    """
-
-    # --------------------------------------------------------
-    # ÉXITO COMPLETO
-    # --------------------------------------------------------
 
     if result.get(
         "success",
@@ -104,10 +101,6 @@ def get_notification_type(
     ):
 
         return "success"
-
-    # --------------------------------------------------------
-    # Comprobar operaciones ejecutadas.
-    # --------------------------------------------------------
 
     operations = result.get(
         "operations",
@@ -122,31 +115,20 @@ def get_notification_type(
         ) == "Filled"
     ]
 
-    # --------------------------------------------------------
-    # EJECUCIÓN PARCIAL
-    # --------------------------------------------------------
-
     if filled_operations:
 
         return "partial"
-
-    # --------------------------------------------------------
-    # FALLO
-    # --------------------------------------------------------
 
     return "failure"
 
 
 # ============================================================
-# CONSTRUIR ASUNTO
+# ASUNTO DEL CORREO
 # ============================================================
 
 def build_subject(
     result
 ):
-    """
-    Construye el asunto del correo.
-    """
 
     notification_type = (
         get_notification_type(
@@ -166,25 +148,18 @@ def build_subject(
 
 
 # ============================================================
-# CONSTRUIR CUERPO
+# CUERPO DEL CORREO
 # ============================================================
 
 def build_body(
     result
 ):
-    """
-    Construye el cuerpo completo de la notificación.
-    """
 
     notification_type = (
         get_notification_type(
             result
         )
     )
-
-    # ========================================================
-    # DATOS GENERALES
-    # ========================================================
 
     message_id = result.get(
         "message_id",
@@ -230,10 +205,6 @@ def build_body(
         "error"
     )
 
-    # ========================================================
-    # CONSTRUIR CUERPO
-    # ========================================================
-
     lines = []
 
     lines.append(
@@ -246,9 +217,9 @@ def build_body(
 
     lines.append("")
 
-    # ========================================================
-    # RESULTADO GENERAL
-    # ========================================================
+    # --------------------------------------------------------
+    # RESULTADO
+    # --------------------------------------------------------
 
     if notification_type == "success":
 
@@ -270,9 +241,9 @@ def build_body(
 
     lines.append("")
 
-    # ========================================================
-    # INFORMACIÓN DEL CORREO
-    # ========================================================
+    # --------------------------------------------------------
+    # INFORMACIÓN DE LA SEÑAL
+    # --------------------------------------------------------
 
     lines.append(
         "INFORMACIÓN DE LA SEÑAL"
@@ -308,9 +279,9 @@ def build_body(
 
     lines.append("")
 
-    # ========================================================
+    # --------------------------------------------------------
     # RESULTADO GENERAL
-    # ========================================================
+    # --------------------------------------------------------
 
     lines.append(
         "RESULTADO DE EJECUCIÓN"
@@ -331,9 +302,9 @@ def build_body(
 
     lines.append("")
 
-    # ========================================================
+    # --------------------------------------------------------
     # OPERACIONES
-    # ========================================================
+    # --------------------------------------------------------
 
     operations = result.get(
         "operations",
@@ -359,10 +330,6 @@ def build_body(
                 f"OPERACIÓN {index}"
             )
 
-            # ------------------------------------------------
-            # Acción de la señal
-            # ------------------------------------------------
-
             signal_action = operation.get(
                 "signal_action"
             )
@@ -374,54 +341,30 @@ def build_body(
                     f"{signal_action}"
                 )
 
-            # ------------------------------------------------
-            # Acción real IBKR
-            # ------------------------------------------------
-
             lines.append(
                 f"  Acción IBKR: "
                 f"{operation.get('action', 'N/A')}"
             )
-
-            # ------------------------------------------------
-            # Estado
-            # ------------------------------------------------
 
             lines.append(
                 f"  Estado: "
                 f"{operation.get('status', 'N/A')}"
             )
 
-            # ------------------------------------------------
-            # Cantidad
-            # ------------------------------------------------
-
             lines.append(
                 f"  Cantidad ejecutada: "
                 f"{format_number(operation.get('filled', 0))}"
             )
-
-            # ------------------------------------------------
-            # Precio
-            # ------------------------------------------------
 
             lines.append(
                 f"  Precio ejecución: "
                 f"{format_number(operation.get('price'))}"
             )
 
-            # ------------------------------------------------
-            # Posición resultante
-            # ------------------------------------------------
-
             lines.append(
                 f"  Posición tras operación: "
                 f"{format_number(operation.get('position'))}"
             )
-
-            # ------------------------------------------------
-            # Posición esperada
-            # ------------------------------------------------
 
             expected_position = operation.get(
                 "expected_position"
@@ -434,10 +377,6 @@ def build_body(
                     f"{format_number(expected_position)}"
                 )
 
-            # ------------------------------------------------
-            # Order ID
-            # ------------------------------------------------
-
             order_id = operation.get(
                 "order_id"
             )
@@ -449,10 +388,6 @@ def build_body(
                     f"{order_id}"
                 )
 
-            # ------------------------------------------------
-            # Error
-            # ------------------------------------------------
-
             operation_error = operation.get(
                 "error"
             )
@@ -463,10 +398,6 @@ def build_body(
                     f"  Error: "
                     f"{operation_error}"
                 )
-
-            # ------------------------------------------------
-            # Código de error IBKR
-            # ------------------------------------------------
 
             error_code = operation.get(
                 "error_code"
@@ -497,9 +428,9 @@ def build_body(
 
         lines.append("")
 
-    # ========================================================
+    # --------------------------------------------------------
     # ERROR GENERAL
-    # ========================================================
+    # --------------------------------------------------------
 
     if general_error:
 
@@ -517,9 +448,9 @@ def build_body(
 
         lines.append("")
 
-    # ========================================================
+    # --------------------------------------------------------
     # POSICIÓN FINAL
-    # ========================================================
+    # --------------------------------------------------------
 
     lines.append(
         "POSICIÓN FINAL"
@@ -535,9 +466,9 @@ def build_body(
 
     lines.append("")
 
-    # ========================================================
+    # --------------------------------------------------------
     # MENSAJE FINAL
-    # ========================================================
+    # --------------------------------------------------------
 
     if notification_type == "success":
 
@@ -577,45 +508,47 @@ def build_body(
 def send_notification(
     result
 ):
-    """
-    Envía el resultado de una operación mediante Gmail SMTP.
 
-    No ejecuta operaciones y no modifica el estado de Gmail.
-    """
+    message_id = result.get(
+        "message_id"
+    )
+
+    notification_type = (
+        get_notification_type(
+            result
+        )
+    )
 
     # --------------------------------------------------------
-    # Comprobar configuración.
+    # VALIDACIÓN DE CONFIGURACIÓN
     # --------------------------------------------------------
 
     if not GMAIL_USER:
 
-        print(
-            "ERROR NOTIFIER: "
-            "falta GMAIL_USER."
+        log_error(
+            "Notifier: falta GMAIL_USER."
         )
 
         return False
 
     if not GMAIL_APP_PASSWORD:
 
-        print(
-            "ERROR NOTIFIER: "
-            "falta GMAIL_APP_PASSWORD."
+        log_error(
+            "Notifier: falta GMAIL_APP_PASSWORD."
         )
 
         return False
 
     if not NOTIFY_EMAIL:
 
-        print(
-            "ERROR NOTIFIER: "
-            "falta NOTIFY_EMAIL."
+        log_error(
+            "Notifier: falta NOTIFY_EMAIL."
         )
 
         return False
 
     # --------------------------------------------------------
-    # Construir mensaje.
+    # CONSTRUIR MENSAJE
     # --------------------------------------------------------
 
     subject = build_subject(
@@ -624,6 +557,13 @@ def send_notification(
 
     body = build_body(
         result
+    )
+
+    log_info(
+        f"Preparando notificación | "
+        f"Message-ID={message_id} | "
+        f"Type={notification_type} | "
+        f"Subject={subject}"
     )
 
     try:
@@ -650,14 +590,15 @@ def send_notification(
             )
         )
 
-        print()
-        print(
-            "Enviando notificación..."
-        )
+        # ----------------------------------------------------
+        # CONEXIÓN SMTP
+        # ----------------------------------------------------
 
-        # ----------------------------------------------------
-        # SMTP SSL Gmail
-        # ----------------------------------------------------
+        log_info(
+            f"Conectando SMTP | "
+            f"Server={SMTP_SERVER} | "
+            f"Port={SMTP_PORT}"
+        )
 
         with smtplib.SMTP_SSL(
             SMTP_SERVER,
@@ -669,11 +610,27 @@ def send_notification(
                 GMAIL_APP_PASSWORD
             )
 
+            log_info(
+                f"Autenticación SMTP correcta | "
+                f"User={GMAIL_USER}"
+            )
+
             smtp.sendmail(
                 GMAIL_USER,
                 NOTIFY_EMAIL,
                 message.as_string()
             )
+
+        # ----------------------------------------------------
+        # ÉXITO
+        # ----------------------------------------------------
+
+        log_info(
+            f"Notificación enviada | "
+            f"Message-ID={message_id} | "
+            f"Type={notification_type} | "
+            f"Subject={subject}"
+        )
 
         print(
             f"Notificación enviada: "
@@ -684,26 +641,36 @@ def send_notification(
 
     except Exception as error:
 
+        # ----------------------------------------------------
+        # ERROR SMTP
+        # ----------------------------------------------------
+
+        log_error(
+            f"Error enviando notificación | "
+            f"Message-ID={message_id} | "
+            f"Type={notification_type} | "
+            f"Subject={subject} | "
+            f"{type(error).__name__}: {error}"
+        )
+
         print()
         print(
             "ERROR AL ENVIAR NOTIFICACIÓN"
         )
 
         print(
-            f"Tipo: "
-            f"{type(error).__name__}"
+            f"Tipo: {type(error).__name__}"
         )
 
         print(
-            f"Mensaje: "
-            f"{error}"
+            f"Mensaje: {error}"
         )
 
         return False
 
 
 # ============================================================
-# PRUEBAS LOCALES
+# PRUEBA
 # ============================================================
 
 def main():
@@ -720,200 +687,9 @@ def main():
         "========================================"
     )
 
-    # ========================================================
-    # PRUEBA 1 — ÉXITO SIMPLE
-    # ========================================================
-
-    test_success = {
-
-        "success": True,
-
-        "type": "single",
-
-        "message_id": (
-            "<test-success@gmail.com>"
-        ),
-
-        "email_uid": "TEST-001",
-
-        "sender": (
-            "Operativa Dax "
-            "<operativadax@gmail.com>"
-        ),
-
-        "date": (
-            "Thu, 20 Aug 2026 "
-            "16:31:03 +0200"
-        ),
-
-        "subject": (
-            "Operativa Dax - "
-            "Abro Largos en 26421"
-        ),
-
-        "actions": [
-            "ABRIR_LARGO"
-        ],
-
-        "status": "Filled",
-
-        "filled": 1.0,
-
-        "price": 26486.0,
-
-        "position": 1.0,
-
-        "expected_position": 1.0,
-
-        "order_id": 100,
-
-        "operations": [
-
-            {
-                "success": True,
-                "signal_action": "ABRIR_LARGO",
-                "action": "BUY",
-                "status": "Filled",
-                "filled": 1.0,
-                "price": 26486.0,
-                "position": 1.0,
-                "expected_position": 1.0,
-                "order_id": 100
-            }
-
-        ]
-
-    }
-
-    # ========================================================
-    # PRUEBA 2 — TRANSICIÓN COMPLETA
-    # ========================================================
-
-    test_sequence = {
-
-        "success": True,
-
-        "type": "sequence",
-
-        "message_id": (
-            "<test-sequence@gmail.com>"
-        ),
-
-        "email_uid": "TEST-002",
-
-        "sender": (
-            "Operativa Dax "
-            "<operativadax@gmail.com>"
-        ),
-
-        "date": (
-            "Thu, 20 Aug 2026 "
-            "16:35:03 +0200"
-        ),
-
-        "subject": (
-            "Operativa Dax - "
-            "Cierro Largos y Abro Cortos"
-        ),
-
-        "actions": [
-            "CERRAR_LARGO",
-            "ABRIR_CORTO"
-        ],
-
-        "status": "FILLED",
-
-        "filled": 2.0,
-
-        "price": 26490.0,
-
-        "position": -1.0,
-
-        "operations": [
-
-            {
-                "success": True,
-                "signal_action": "CERRAR_LARGO",
-                "action": "SELL",
-                "status": "Filled",
-                "filled": 1.0,
-                "price": 26490.0,
-                "position": 0.0,
-                "expected_position": 0.0,
-                "order_id": 101
-            },
-
-            {
-                "success": True,
-                "signal_action": "ABRIR_CORTO",
-                "action": "SELL",
-                "status": "Filled",
-                "filled": 1.0,
-                "price": 26488.0,
-                "position": -1.0,
-                "expected_position": -1.0,
-                "order_id": 102
-            }
-
-        ]
-
-    }
-
-    # ========================================================
-    # MOSTRAR PRUEBAS
-    # ========================================================
-
-    tests = [
-        (
-            "ÉXITO SIMPLE",
-            test_success
-        ),
-        (
-            "SECUENCIA COMPLETA",
-            test_sequence
-        )
-    ]
-
-    for test_name, test_result in tests:
-
-        print()
-        print(
-            "========================================"
-        )
-
-        print(
-            f"PRUEBA: {test_name}"
-        )
-
-        print(
-            "========================================"
-        )
-
-        print(
-            f"Asunto: "
-            f"{build_subject(test_result)}"
-        )
-
-        print()
-
-        print(
-            build_body(
-                test_result
-            )
-        )
-
-        print(
-            "========================================"
-        )
-
-    # --------------------------------------------------------
-    # IMPORTANTE:
-    #
-    # Las pruebas NO envían correos.
-    #
-    # send_notification() solo se llamará desde
-    # bot_auto.py cuando hagamos la integración.
-    # --------------------------------------------------------
+    log_info(
+        "Notifier cargado correctamente."
+    )
 
 
 # ============================================================

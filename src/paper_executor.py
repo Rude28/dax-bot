@@ -6,6 +6,19 @@ from ibapi.contract import Contract
 from ibapi.order import Order
 from ibapi.execution import ExecutionFilter
 
+from logger import (
+    log_info,
+    log_warning,
+    log_error,
+)
+
+from bot_state import (
+    bot_state,
+    CONNECTED,
+    RECONNECTING_IBKR,
+    SAFETY_LOCK,
+)
+
 
 # ============================================================
 # CONFIGURACIÓN
@@ -57,6 +70,12 @@ class PaperExecutor(EWrapper, EClient):
         self.connection_ready = (
             threading.Event()
         )
+
+        self.connection_lost = (
+            threading.Event()
+        )
+
+        self.api_thread = None
 
         # ====================================================
         # POSICIÓN
@@ -136,7 +155,11 @@ class PaperExecutor(EWrapper, EClient):
             int(orderId)
         )
 
+        self.connection_lost.clear()
         self.connection_ready.set()
+
+        bot_state.set_ibkr_connected(True)
+        bot_state.set_status(CONNECTED)
 
         print()
         print(
@@ -155,6 +178,11 @@ class PaperExecutor(EWrapper, EClient):
             "========================================"
         )
 
+        log_info(
+            f"Conexión IBKR correcta | "
+            f"Next Order ID={orderId}"
+        )
+
         # ----------------------------------------------------
         # Solicitar posiciones iniciales.
         # ----------------------------------------------------
@@ -168,7 +196,69 @@ class PaperExecutor(EWrapper, EClient):
             "Solicitando posiciones iniciales..."
         )
 
+        log_info(
+            "Solicitando posiciones iniciales a IBKR."
+        )
+
         self.reqPositions()
+
+    # ========================================================
+    # DESCONEXIÓN
+    # ========================================================
+
+    def connectionClosed(self):
+        """
+        Callback de IBKR cuando la conexión se cierra.
+
+        Esta función NO intenta reconectar.
+        El coordinador (bot_auto.py) será responsable de la
+        reconexión y de la reconciliación de cualquier orden
+        que pudiera estar en PROCESSING.
+        """
+
+        self.connection_lost.set()
+        self.connection_ready.clear()
+
+        bot_state.set_ibkr_connected(False)
+        bot_state.set_status(RECONNECTING_IBKR)
+
+        log_warning(
+            "Conexión IBKR cerrada | "
+            "El ejecutor queda bloqueado hasta reconexión."
+        )
+
+        print()
+        print(
+            "IBKR DESCONECTADO."
+        )
+
+        print(
+            "Nuevas órdenes bloqueadas hasta reconexión."
+        )
+
+        try:
+            super().connectionClosed()
+        except Exception:
+            pass
+
+    def is_trading_connection_ready(self):
+        """
+        Devuelve True únicamente si la conexión IBKR está
+        disponible y no se ha detectado una desconexión.
+        """
+
+        try:
+            api_connected = bool(
+                self.isConnected()
+            )
+        except Exception:
+            api_connected = False
+
+        return (
+            api_connected
+            and not self.connection_lost.is_set()
+            and self.connection_ready.is_set()
+        )
 
     # ========================================================
     # ERRORES
@@ -182,6 +272,47 @@ class PaperExecutor(EWrapper, EClient):
         errorString,
         advancedOrderRejectJson=""
     ):
+
+        # ----------------------------------------------------
+        # Eventos de conectividad.
+        # ----------------------------------------------------
+
+        if errorCode in (
+            1100,
+            1300
+        ):
+
+            self.connection_lost.set()
+            self.connection_ready.clear()
+
+            bot_state.set_ibkr_connected(False)
+            bot_state.set_status(RECONNECTING_IBKR)
+
+            log_warning(
+                f"IBKR conectividad perdida | "
+                f"code={errorCode} | {errorString}"
+            )
+
+            print()
+            print(
+                "IBKR CONEXIÓN NO DISPONIBLE."
+            )
+
+            return
+
+        if errorCode in (
+            1101,
+            1102
+        ):
+
+            log_info(
+                f"IBKR conectividad restaurada | "
+                f"code={errorCode} | {errorString}"
+            )
+
+            bot_state.set_ibkr_connected(True)
+
+            return
 
         # ----------------------------------------------------
         # Mensajes informativos normales de IBKR.
@@ -199,13 +330,25 @@ class PaperExecutor(EWrapper, EClient):
                 f"{errorString}"
             )
 
+            log_info(
+                f"IBKR INFO | reqId={reqId} | "
+                f"code={errorCode} | "
+                f"{errorString}"
+            )
+
             return
 
         # ----------------------------------------------------
-        # Mostrar error.
+        # Error.
         # ----------------------------------------------------
 
         print(
+            f"IBKR ERROR | reqId={reqId} | "
+            f"code={errorCode} | "
+            f"message={errorString}"
+        )
+
+        log_error(
             f"IBKR ERROR | reqId={reqId} | "
             f"code={errorCode} | "
             f"message={errorString}"
@@ -280,12 +423,22 @@ class PaperExecutor(EWrapper, EClient):
             "----------------------------------------"
         )
 
+        log_info(
+            f"Posición FDXM actualizada | "
+            f"Position={self.current_position} | "
+            f"AvgCost={self.position_avg_cost}"
+        )
+
         self.position_update_event.set()
 
     def positionEnd(self):
 
         print()
         print(
+            "Posiciones iniciales recibidas."
+        )
+
+        log_info(
             "Posiciones iniciales recibidas."
         )
 
@@ -379,6 +532,15 @@ class PaperExecutor(EWrapper, EClient):
             f"Restante: {remaining}"
         )
 
+        log_info(
+            f"Estado orden | "
+            f"OrderID={orderId} | "
+            f"Status={status} | "
+            f"Filled={filled} | "
+            f"Remaining={remaining} | "
+            f"AvgFillPrice={avgFillPrice}"
+        )
+
         if status in (
             "Filled",
             "Cancelled",
@@ -414,9 +576,19 @@ class PaperExecutor(EWrapper, EClient):
             f"Status: {orderState.status}"
         )
 
+        log_info(
+            f"IBKR OPEN ORDER | "
+            f"OrderID={orderId} | "
+            f"Status={orderState.status}"
+        )
+
     def openOrderEnd(self):
 
         self.open_orders_event.set()
+
+        log_info(
+            "Fin de consulta de órdenes abiertas."
+        )
 
     # ========================================================
     # COMPLETED ORDERS
@@ -452,9 +624,19 @@ class PaperExecutor(EWrapper, EClient):
             f"Status: {orderState.status}"
         )
 
+        log_info(
+            f"IBKR COMPLETED ORDER | "
+            f"OrderID={order_id} | "
+            f"Status={orderState.status}"
+        )
+
     def completedOrdersEnd(self):
 
         self.completed_orders_event.set()
+
+        log_info(
+            "Fin de consulta de órdenes completadas."
+        )
 
     # ========================================================
     # EJECUCIONES
@@ -513,6 +695,15 @@ class PaperExecutor(EWrapper, EClient):
             f"Price:    {execution.price}"
         )
 
+        log_info(
+            f"IBKR EXECUTION | "
+            f"OrderID={order_id} | "
+            f"ExecID={execution.execId} | "
+            f"Shares={execution.shares} | "
+            f"Price={execution.price} | "
+            f"Side={execution.side}"
+        )
+
     def execDetailsEnd(
         self,
         reqId
@@ -523,6 +714,11 @@ class PaperExecutor(EWrapper, EClient):
         ):
 
             self.executions_event.set()
+
+            log_info(
+                f"Fin de consulta de ejecuciones | "
+                f"RequestID={reqId}"
+            )
 
     # ========================================================
     # ESPERAR POSICIÓN
@@ -580,6 +776,33 @@ class PaperExecutor(EWrapper, EClient):
         esperada.
         """
 
+        if not self.is_trading_connection_ready():
+
+            log_warning(
+                f"Orden bloqueada por desconexión IBKR | "
+                f"Action={action} | "
+                f"Position={self.current_position}"
+            )
+
+            return {
+                "success": False,
+                "action": action,
+                "status": "IBKR_DISCONNECTED",
+                "filled": 0.0,
+                "price": 0.0,
+                "position": self.current_position,
+                "error": (
+                    "IBKR no está conectado. "
+                    "La orden no se ha enviado."
+                )
+            }
+
+        log_info(
+            f"Solicitud de orden | "
+            f"Action={action} | "
+            f"CurrentPosition={self.current_position}"
+        )
+
         with self.order_lock:
 
             return self._send_order_locked(
@@ -595,11 +818,34 @@ class PaperExecutor(EWrapper, EClient):
         action
     ):
 
+        if not self.is_trading_connection_ready():
+
+            log_warning(
+                f"Orden cancelada antes de placeOrder por desconexión | "
+                f"Action={action}"
+            )
+
+            return {
+                "success": False,
+                "action": action,
+                "status": "IBKR_DISCONNECTED",
+                "filled": 0.0,
+                "price": 0.0,
+                "position": self.current_position,
+                "error": (
+                    "IBKR se desconectó antes de enviar la orden."
+                )
+            }
+
         # ----------------------------------------------------
         # Comprobar Order ID.
         # ----------------------------------------------------
 
         if self.next_order_id is None:
+
+            log_error(
+                "No existe Order ID disponible."
+            )
 
             return {
                 "success": False,
@@ -642,6 +888,10 @@ class PaperExecutor(EWrapper, EClient):
             )
 
         else:
+
+            log_error(
+                f"Acción no válida: {action}"
+            )
 
             return {
                 "success": False,
@@ -741,9 +991,39 @@ class PaperExecutor(EWrapper, EClient):
             "========================================"
         )
 
+        log_info(
+            f"Enviando orden | "
+            f"OrderID={order_id} | "
+            f"Action={action} | "
+            f"Quantity={QUANTITY} | "
+            f"InitialPosition={initial_position} | "
+            f"ExpectedPosition={expected_position}"
+        )
+
         # ----------------------------------------------------
         # ENVIAR
         # ----------------------------------------------------
+
+        if not self.is_trading_connection_ready():
+
+            log_warning(
+                f"Orden no enviada: conexión perdida justo antes de placeOrder | "
+                f"OrderID={order_id} | Action={action}"
+            )
+
+            return {
+                "success": False,
+                "action": action,
+                "status": "IBKR_DISCONNECTED",
+                "filled": 0.0,
+                "price": 0.0,
+                "position": self.current_position,
+                "expected_position": expected_position,
+                "order_id": order_id,
+                "error": (
+                    "IBKR se desconectó antes de enviar la orden."
+                )
+            }
 
         self.placeOrder(
             order_id,
@@ -777,6 +1057,13 @@ class PaperExecutor(EWrapper, EClient):
                 "la ejecución."
             )
 
+            log_error(
+                f"TIMEOUT de orden | "
+                f"OrderID={order_id} | "
+                f"Action={action} | "
+                f"Filled={self.order_filled}"
+            )
+
             return {
                 "success": False,
                 "action": action,
@@ -805,6 +1092,14 @@ class PaperExecutor(EWrapper, EClient):
         # ----------------------------------------------------
 
         if self.order_status == "ERROR":
+
+            log_error(
+                f"Orden con error | "
+                f"OrderID={order_id} | "
+                f"Action={action} | "
+                f"ErrorCode={self.error_code} | "
+                f"Error={self.error_message}"
+            )
 
             return {
                 "success": False,
@@ -868,6 +1163,14 @@ class PaperExecutor(EWrapper, EClient):
                 "========================================"
             )
 
+            log_info(
+                f"Orden FILLED | "
+                f"OrderID={order_id} | "
+                f"Action={action} | "
+                f"Filled={self.order_filled} | "
+                f"Price={self.order_avg_fill_price}"
+            )
+
             # ------------------------------------------------
             # Cantidad completa.
             # ------------------------------------------------
@@ -875,6 +1178,13 @@ class PaperExecutor(EWrapper, EClient):
             if self.order_filled != float(
                 QUANTITY
             ):
+
+                log_warning(
+                    f"Ejecución parcial | "
+                    f"OrderID={order_id} | "
+                    f"Filled={self.order_filled} | "
+                    f"Expected={QUANTITY}"
+                )
 
                 return {
                     "success": False,
@@ -926,6 +1236,13 @@ class PaperExecutor(EWrapper, EClient):
                     f"{self.current_position}"
                 )
 
+                log_error(
+                    f"POSITION_MISMATCH | "
+                    f"OrderID={order_id} | "
+                    f"Expected={expected_position} | "
+                    f"Actual={self.current_position}"
+                )
+
                 return {
                     "success": False,
                     "action": action,
@@ -955,6 +1272,14 @@ class PaperExecutor(EWrapper, EClient):
             # ÉXITO
             # ------------------------------------------------
 
+            log_info(
+                f"Orden completada correctamente | "
+                f"OrderID={order_id} | "
+                f"Action={action} | "
+                f"Price={self.order_avg_fill_price} | "
+                f"Position={self.current_position}"
+            )
+
             return {
                 "success": True,
                 "action": action,
@@ -977,6 +1302,13 @@ class PaperExecutor(EWrapper, EClient):
         # ----------------------------------------------------
         # OTROS ESTADOS
         # ----------------------------------------------------
+
+        log_warning(
+            f"Orden terminó en estado no esperado | "
+            f"OrderID={order_id} | "
+            f"Status={self.order_status} | "
+            f"Filled={self.order_filled}"
+        )
 
         return {
             "success": False,
@@ -1028,6 +1360,28 @@ class PaperExecutor(EWrapper, EClient):
             order_id
         )
 
+        if not self.is_trading_connection_ready():
+
+            log_warning(
+                f"No se puede reconciliar OrderID={order_id}: "
+                "IBKR no está conectado."
+            )
+
+            return {
+                "found": False,
+                "source": None,
+                "order_id": order_id,
+                "status": "IBKR_DISCONNECTED",
+                "filled": 0.0,
+                "price": 0.0,
+                "executions": [],
+                "action": None,
+                "total_quantity": None,
+                "error": (
+                    "No se puede reconciliar sin conexión IBKR."
+                )
+            }
+
         print()
         print(
             "========================================"
@@ -1043,6 +1397,11 @@ class PaperExecutor(EWrapper, EClient):
 
         print(
             "========================================"
+        )
+
+        log_info(
+            f"Iniciando reconciliación | "
+            f"OrderID={order_id}"
         )
 
         # ----------------------------------------------------
@@ -1069,6 +1428,11 @@ class PaperExecutor(EWrapper, EClient):
             "Consultando órdenes abiertas..."
         )
 
+        log_info(
+            f"Consultando órdenes abiertas | "
+            f"OrderID={order_id}"
+        )
+
         self.reqOpenOrders()
 
         if not self.open_orders_event.wait(
@@ -1078,6 +1442,10 @@ class PaperExecutor(EWrapper, EClient):
             print(
                 "TIMEOUT consultando "
                 "órdenes abiertas."
+            )
+
+            log_warning(
+                "TIMEOUT consultando órdenes abiertas."
             )
 
         open_order = (
@@ -1094,6 +1462,11 @@ class PaperExecutor(EWrapper, EClient):
             "Consultando órdenes completadas..."
         )
 
+        log_info(
+            f"Consultando órdenes completadas | "
+            f"OrderID={order_id}"
+        )
+
         self.reqCompletedOrders(
             True
         )
@@ -1105,6 +1478,10 @@ class PaperExecutor(EWrapper, EClient):
             print(
                 "TIMEOUT consultando "
                 "órdenes completadas."
+            )
+
+            log_warning(
+                "TIMEOUT consultando órdenes completadas."
             )
 
         completed_order = (
@@ -1129,14 +1506,17 @@ class PaperExecutor(EWrapper, EClient):
             "Consultando ejecuciones..."
         )
 
+        log_info(
+            f"Consultando ejecuciones | "
+            f"RequestID={execution_req_id} | "
+            f"OrderID={order_id}"
+        )
+
         execution_filter = (
             ExecutionFilter()
         )
 
-        # IMPORTANTE:
         # No filtramos aquí por orderId.
-        # Recibimos las ejecuciones y posteriormente
-        # seleccionamos las que pertenecen al order_id.
         self.reqExecutions(
             execution_req_id,
             execution_filter
@@ -1149,6 +1529,11 @@ class PaperExecutor(EWrapper, EClient):
             print(
                 "TIMEOUT consultando "
                 "ejecuciones."
+            )
+
+            log_warning(
+                f"TIMEOUT consultando ejecuciones | "
+                f"OrderID={order_id}"
             )
 
         executions = (
@@ -1189,6 +1574,12 @@ class PaperExecutor(EWrapper, EClient):
 
             print(
                 f"Estado: {status}"
+            )
+
+            log_warning(
+                f"Orden encontrada abierta | "
+                f"OrderID={order_id} | "
+                f"Status={status}"
             )
 
             return {
@@ -1290,6 +1681,14 @@ class PaperExecutor(EWrapper, EClient):
                 f"{average_price}"
             )
 
+            log_info(
+                f"Orden reconciliada | "
+                f"OrderID={order_id} | "
+                f"Status={status} | "
+                f"Filled={filled} | "
+                f"Price={average_price}"
+            )
+
             return {
                 "found": True,
                 "source": "COMPLETED",
@@ -1322,6 +1721,11 @@ class PaperExecutor(EWrapper, EClient):
         print(
             "No existe evidencia suficiente "
             "para determinar su resultado."
+        )
+
+        log_warning(
+            f"Orden UNKNOWN | "
+            f"OrderID={order_id}"
         )
 
         return {
@@ -1365,6 +1769,11 @@ def open_long(
             "Ya existe una posición."
         )
 
+        log_warning(
+            f"ABRIR_LARGO bloqueado | "
+            f"Position={position}"
+        )
+
         return {
             "success": False,
             "action": "BUY",
@@ -1402,6 +1811,13 @@ def open_long(
             "LARGO <<<"
         )
 
+        log_info(
+            f"ABRIR_LARGO ejecutado | "
+            f"OrderID={result.get('order_id')} | "
+            f"Price={result.get('price')} | "
+            f"Position={result.get('position')}"
+        )
+
     return result
 
 
@@ -1427,6 +1843,11 @@ def open_short(
 
         print(
             "Ya existe una posición."
+        )
+
+        log_warning(
+            f"ABRIR_CORTO bloqueado | "
+            f"Position={position}"
         )
 
         return {
@@ -1466,6 +1887,13 @@ def open_short(
             "CORTO <<<"
         )
 
+        log_info(
+            f"ABRIR_CORTO ejecutado | "
+            f"OrderID={result.get('order_id')} | "
+            f"Price={result.get('price')} | "
+            f"Position={result.get('position')}"
+        )
+
     return result
 
 
@@ -1489,6 +1917,11 @@ def close_position(
 
     if position == 0:
 
+        log_warning(
+            "CERRAR_POSICION bloqueado | "
+            "No existe posición."
+        )
+
         return {
             "success": False,
             "action": None,
@@ -1508,6 +1941,7 @@ def close_position(
     if position > 0:
 
         action = "SELL"
+
         signal_action = (
             "CERRAR_LARGO"
         )
@@ -1515,6 +1949,7 @@ def close_position(
     else:
 
         action = "BUY"
+
         signal_action = (
             "CERRAR_CORTO"
         )
@@ -1524,6 +1959,12 @@ def close_position(
     )
 
     if quantity != QUANTITY:
+
+        log_warning(
+            f"Cierre bloqueado | "
+            f"Position={position} | "
+            f"Quantity={quantity}"
+        )
 
         return {
             "success": False,
@@ -1561,6 +2002,13 @@ def close_position(
             ">>> OPERACIÓN CERRADA <<<"
         )
 
+        log_info(
+            f"{signal_action} ejecutado | "
+            f"OrderID={result.get('order_id')} | "
+            f"Price={result.get('price')} | "
+            f"Position={result.get('position')}"
+        )
+
     return result
 
 
@@ -1569,6 +2017,10 @@ def close_position(
 # ============================================================
 
 def main():
+
+    log_info(
+        "PaperExecutor iniciado en modo manual."
+    )
 
     app = PaperExecutor()
 
@@ -1598,6 +2050,11 @@ def main():
             "la conexión con IBKR."
         )
 
+        log_error(
+            "No se pudo establecer conexión con IBKR "
+            "en modo manual."
+        )
+
         app.disconnect()
 
         return
@@ -1614,6 +2071,11 @@ def main():
         print(
             "No se recibieron las posiciones "
             "iniciales de IBKR."
+        )
+
+        log_error(
+            "No se recibieron posiciones iniciales "
+            "en modo manual."
         )
 
         app.disconnect()
@@ -1658,6 +2120,11 @@ def main():
 
     print(
         "========================================"
+    )
+
+    log_info(
+        f"PaperExecutor manual preparado | "
+        f"Position={app.current_position}"
     )
 
     # --------------------------------------------------------
@@ -1737,11 +2204,20 @@ def main():
                 f"{position} contratos"
             )
 
+            log_info(
+                f"Consulta manual de posición | "
+                f"Position={position}"
+            )
+
         elif option == "5":
 
             print()
             print(
                 "Cerrando programa..."
+            )
+
+            log_info(
+                "PaperExecutor manual detenido."
             )
 
             app.disconnect()
@@ -1753,6 +2229,11 @@ def main():
             print()
             print(
                 "Opción no válida."
+            )
+
+            log_warning(
+                f"Opción manual no válida | "
+                f"Option={option}"
             )
 
 

@@ -1,20 +1,20 @@
 import imaplib
 import email
-import os
 
 from email.header import decode_header
 
-from dotenv import load_dotenv
-
 from signal_parser import parse_signal
+
 from signal_state import (
     SignalState,
     NEW,
     REJECTED,
-    SUCCESS,
-    FAILED,
-    PARTIAL,
-    PROCESSING,
+)
+
+from logger import (
+    log_info,
+    log_warning,
+    log_error,
 )
 
 
@@ -22,47 +22,13 @@ from signal_state import (
 # CONFIGURACIÓN
 # ============================================================
 
-load_dotenv()
-
-# ------------------------------------------------------------
-# GMAIL
-# ------------------------------------------------------------
-
-GMAIL_USER = os.getenv(
-    "GMAIL_USER"
-)
-
-GMAIL_APP_PASSWORD = os.getenv(
-    "GMAIL_APP_PASSWORD"
-)
-
-# ------------------------------------------------------------
-# IMAP
-# ------------------------------------------------------------
-
-IMAP_SERVER = os.getenv(
-    "IMAP_SERVER",
-    "imap.gmail.com"
-)
-
-IMAP_PORT = int(
-    os.getenv(
-        "IMAP_PORT",
-        "993"
-    )
-)
-
-# ------------------------------------------------------------
-# PROVEEDOR DE SEÑALES
-# ------------------------------------------------------------
-
 SIGNAL_SENDER = (
     "operativadax@gmail.com"
 )
 
 
 # ============================================================
-# GESTOR DE ESTADOS
+# ESTADO
 # ============================================================
 
 state_manager = SignalState()
@@ -105,36 +71,12 @@ def decode_mime_header(
 
 
 # ============================================================
-# COMPROBAR ESTADO
+# COMPROBAR ESTADO EXISTENTE
 # ============================================================
 
 def get_existing_signal_status(
     message_id
 ):
-    """
-    Devuelve el estado actual de una señal.
-
-    None
-        → señal no registrada
-
-    NEW
-        → pendiente de ejecución
-
-    PROCESSING
-        → en proceso
-
-    SUCCESS
-        → ejecutada correctamente
-
-    FAILED
-        → ejecución fallida
-
-    PARTIAL
-        → ejecución parcial
-
-    REJECTED
-        → señal rechazada/no reconocida
-    """
 
     return state_manager.get_status(
         message_id
@@ -142,7 +84,7 @@ def get_existing_signal_status(
 
 
 # ============================================================
-# CREAR SEÑAL BASE
+# CONSTRUIR SEÑAL
 # ============================================================
 
 def build_signal(
@@ -156,30 +98,68 @@ def build_signal(
     status,
     error=None
 ):
-    """
-    Construye una señal estructurada común para señales
-    válidas y rechazadas.
-    """
 
     return {
         "valid": valid,
-
         "status": status,
-
         "email_uid": email_uid_text,
-
         "message_id": message_id,
-
         "sender": sender,
-
         "subject": subject,
-
         "date": date,
-
         "actions": actions,
-
         "error": error
     }
+
+
+# ============================================================
+# COMPROBAR CONEXIÓN IMAP
+# ============================================================
+
+def check_mail_connection(
+    mail
+):
+    """
+    Comprueba que la conexión IMAP sigue viva.
+
+    Devuelve True si responde correctamente.
+
+    Lanza la excepción original si Gmail/IMAP
+    no responde correctamente.
+    """
+
+    if mail is None:
+
+        raise RuntimeError(
+            "La conexión Gmail es None."
+        )
+
+    try:
+
+        status, _ = mail.noop()
+
+        if status != "OK":
+
+            raise ConnectionError(
+                f"Gmail NOOP devolvió estado: "
+                f"{status}"
+            )
+
+        return True
+
+    except (
+        imaplib.IMAP4.abort,
+        imaplib.IMAP4.error,
+        OSError,
+        ConnectionError
+    ) as error:
+
+        log_warning(
+            f"Conexión Gmail no disponible | "
+            f"{type(error).__name__}: {error}"
+        )
+
+        raise
 
 
 # ============================================================
@@ -198,27 +178,57 @@ def process_email(
     - No ejecuta IBKR.
     - No marca el correo como leído.
     - Registra el estado local de la señal.
+
+    Las excepciones IMAP se propagan para que bot_auto.py
+    pueda iniciar la reconexión automática.
     """
+
+    # --------------------------------------------------------
+    # Verificar conexión antes de leer.
+    # --------------------------------------------------------
+
+    check_mail_connection(
+        mail
+    )
 
     # --------------------------------------------------------
     # Obtener mensaje mediante UID.
     # --------------------------------------------------------
 
-    status, msg_data = mail.uid(
-        "fetch",
-        email_uid,
-        "(RFC822)"
-    )
+    try:
+
+        status, msg_data = mail.uid(
+            "fetch",
+            email_uid,
+            "(RFC822)"
+        )
+
+    except (
+        imaplib.IMAP4.abort,
+        imaplib.IMAP4.error,
+        OSError
+    ) as error:
+
+        log_warning(
+            f"Error IMAP durante FETCH | "
+            f"UID={email_uid} | "
+            f"{type(error).__name__}: {error}"
+        )
+
+        raise
 
     if status != "OK":
 
-        print()
-        print(
-            "ERROR: no se pudo leer "
-            "el correo."
+        error = RuntimeError(
+            f"No se pudo leer el correo UID={email_uid}. "
+            f"Estado IMAP={status}"
         )
 
-        return None
+        log_error(
+            str(error)
+        )
+
+        raise error
 
     # --------------------------------------------------------
     # Extraer mensaje MIME.
@@ -269,10 +279,14 @@ def process_email(
 
         else:
 
-            # Fallback.
             message_id = (
                 "imap_uid:"
                 f"{email_uid.decode(errors='replace')}"
+            )
+
+            log_warning(
+                f"Correo sin Message-ID | "
+                f"UID={email_uid}"
             )
 
         # ----------------------------------------------------
@@ -318,6 +332,14 @@ def process_email(
             "----------------------------------------"
         )
 
+        log_info(
+            f"Correo recibido | "
+            f"UID={email_uid_text} | "
+            f"Message-ID={message_id} | "
+            f"Sender={sender} | "
+            f"Subject={subject}"
+        )
+
         # ====================================================
         # COMPROBAR ESTADO PREVIO
         # ====================================================
@@ -344,13 +366,12 @@ def process_email(
                 "No se volverá a ejecutar."
             )
 
-            # ------------------------------------------------
-            # Devolvemos igualmente los metadatos si la señal
-            # estaba REJECTED.
-            #
-            # Esto permite que bot_auto.py pueda decidir
-            # posteriormente si debe notificar/marcar el correo.
-            # ------------------------------------------------
+            log_warning(
+                f"Señal ya registrada | "
+                f"Message-ID={message_id} | "
+                f"UID={email_uid_text} | "
+                f"Status={existing_status}"
+            )
 
             if existing_status == REJECTED:
 
@@ -376,8 +397,14 @@ def process_email(
             subject
         )
 
+        log_info(
+            f"Resultado parser | "
+            f"Message-ID={message_id} | "
+            f"Actions={actions}"
+        )
+
         # ====================================================
-        # SEÑAL NO RECONOCIDA
+        # REJECTED
         # ====================================================
 
         if actions is None:
@@ -392,10 +419,6 @@ def process_email(
                 "una combinación de acciones "
                 "válida."
             )
-
-            # ------------------------------------------------
-            # Registrar REJECTED.
-            # ------------------------------------------------
 
             state_manager.set_status(
                 message_id,
@@ -420,19 +443,13 @@ def process_email(
                 "Estado guardado: REJECTED"
             )
 
-            # ------------------------------------------------
-            # Devolver la señal rechazada.
-            #
-            # bot_auto.py será responsable de:
-            #
-            #   REJECTED
-            #      ↓
-            #   notifier
-            #      ↓
-            #   marcar leído
-            #
-            # Aquí NO se marca el correo.
-            # ------------------------------------------------
+            log_warning(
+                f"Señal REJECTED | "
+                f"Message-ID={message_id} | "
+                f"UID={email_uid_text} | "
+                f"Subject={subject} | "
+                f"Reason={rejection_reason}"
+            )
 
             return build_signal(
                 email_uid_text,
@@ -447,7 +464,7 @@ def process_email(
             )
 
         # ====================================================
-        # CREAR SEÑAL VÁLIDA
+        # SEÑAL VÁLIDA
         # ====================================================
 
         signal = build_signal(
@@ -461,19 +478,6 @@ def process_email(
             NEW,
             None
         )
-
-        # ====================================================
-        # REGISTRAR COMO NEW
-        # ====================================================
-        #
-        # NO utilizamos PROCESSING aquí.
-        #
-        # bot_auto.py cambia:
-        #
-        # NEW → PROCESSING
-        #
-        # justo antes de ejecutar.
-        # ====================================================
 
         state_manager.set_status(
             message_id,
@@ -496,9 +500,12 @@ def process_email(
             error=None
         )
 
-        # ====================================================
-        # MOSTRAR SEÑAL
-        # ====================================================
+        log_info(
+            f"Señal NEW registrada | "
+            f"Message-ID={message_id} | "
+            f"UID={email_uid_text} | "
+            f"Actions={actions}"
+        )
 
         print()
         print(
@@ -552,417 +559,77 @@ def get_unread_signal_emails(
         FROM operativadax@gmail.com
         UNSEEN
 
-    y devuelve UIDs IMAP.
+    Devuelve UIDs IMAP.
+
+    Si la conexión se ha perdido, la excepción se propaga
+    para que bot_auto.py pueda reconectar.
     """
 
-    status, data = mail.uid(
-        "search",
-        None,
-        f'FROM "{SIGNAL_SENDER}" UNSEEN'
+    # --------------------------------------------------------
+    # Comprobar conexión
+    # --------------------------------------------------------
+
+    check_mail_connection(
+        mail
     )
+
+    # --------------------------------------------------------
+    # Buscar
+    # --------------------------------------------------------
+
+    try:
+
+        status, data = mail.uid(
+            "search",
+            None,
+            f'FROM "{SIGNAL_SENDER}" UNSEEN'
+        )
+
+    except (
+        imaplib.IMAP4.abort,
+        imaplib.IMAP4.error,
+        OSError
+    ) as error:
+
+        log_warning(
+            f"Error IMAP durante SEARCH | "
+            f"{type(error).__name__}: {error}"
+        )
+
+        raise
 
     if status != "OK":
 
-        print()
-        print(
-            "ERROR: no se pudieron buscar "
-            "los correos."
+        error = RuntimeError(
+            "No se pudieron buscar correos "
+            f"UNSEEN. Estado IMAP={status}"
+        )
+
+        log_error(
+            str(error)
+        )
+
+        raise error
+
+    if not data or not data[0]:
+
+        log_info(
+            f"No hay correos UNSEEN | "
+            f"Sender={SIGNAL_SENDER}"
         )
 
         return []
 
-    return data[0].split()
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-
-    print(
-        "========================================"
+    email_uids = (
+        data[0].split()
     )
 
-    print(
-        "       DAX BOT - EMAIL READER"
-    )
+    if email_uids:
 
-    print(
-        "========================================"
-    )
-
-    # --------------------------------------------------------
-    # CONFIGURACIÓN
-    # --------------------------------------------------------
-
-    if not GMAIL_USER:
-
-        print(
-            "ERROR: falta GMAIL_USER"
+        log_info(
+            f"Correos UNSEEN encontrados | "
+            f"Cantidad={len(email_uids)} | "
+            f"Sender={SIGNAL_SENDER}"
         )
 
-        return
-
-    if not GMAIL_APP_PASSWORD:
-
-        print(
-            "ERROR: falta GMAIL_APP_PASSWORD"
-        )
-
-        return
-
-    print(
-        f"Usuario:       {GMAIL_USER}"
-    )
-
-    print(
-        f"Servidor IMAP: {IMAP_SERVER}"
-    )
-
-    print(
-        f"Puerto IMAP:   {IMAP_PORT}"
-    )
-
-    print(
-        f"Remitente:     {SIGNAL_SENDER}"
-    )
-
-    print()
-
-    mail = None
-
-    try:
-
-        # ----------------------------------------------------
-        # CONEXIÓN
-        # ----------------------------------------------------
-
-        print(
-            "Conectando con Gmail IMAP..."
-        )
-
-        mail = imaplib.IMAP4_SSL(
-            IMAP_SERVER,
-            IMAP_PORT
-        )
-
-        print(
-            "Conexión IMAP establecida."
-        )
-
-        # ----------------------------------------------------
-        # AUTENTICACIÓN
-        # ----------------------------------------------------
-
-        mail.login(
-            GMAIL_USER,
-            GMAIL_APP_PASSWORD
-        )
-
-        print(
-            "Autenticación con Gmail correcta."
-        )
-
-        # ----------------------------------------------------
-        # INBOX
-        # ----------------------------------------------------
-
-        status, _ = mail.select(
-            "INBOX"
-        )
-
-        if status != "OK":
-
-            print(
-                "ERROR: no se pudo abrir "
-                "INBOX."
-            )
-
-            return
-
-        print(
-            "INBOX seleccionada."
-        )
-
-        # ----------------------------------------------------
-        # BUSCAR CORREOS
-        # ----------------------------------------------------
-
-        print()
-
-        print(
-            f"Buscando correos NO LEÍDOS "
-            f"de {SIGNAL_SENDER}..."
-        )
-
-        email_uids = (
-            get_unread_signal_emails(
-                mail
-            )
-        )
-
-        if not email_uids:
-
-            print()
-
-            print(
-                "No hay señales nuevas."
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # RESUMEN
-        # ----------------------------------------------------
-
-        print()
-
-        print(
-            f"Correos no leídos encontrados: "
-            f"{len(email_uids)}"
-        )
-
-        print()
-
-        print(
-            "========================================"
-        )
-
-        print(
-            "PROCESANDO SEÑALES"
-        )
-
-        print(
-            "========================================"
-        )
-
-        valid_signals = []
-
-        rejected_signals = []
-
-        # ----------------------------------------------------
-        # Procesar en orden.
-        # ----------------------------------------------------
-
-        for email_uid in email_uids:
-
-            print()
-
-            print(
-                "========================================"
-            )
-
-            print(
-                f"Procesando UID: "
-                f"{email_uid.decode(errors='replace')}"
-            )
-
-            print(
-                "========================================"
-            )
-
-            signal = process_email(
-                mail,
-                email_uid
-            )
-
-            if signal is None:
-
-                continue
-
-            # ------------------------------------------------
-            # Señal válida.
-            # ------------------------------------------------
-
-            if signal.get(
-                "valid",
-                False
-            ):
-
-                valid_signals.append(
-                    signal
-                )
-
-            # ------------------------------------------------
-            # Señal rechazada.
-            # ------------------------------------------------
-
-            elif signal.get(
-                "status"
-            ) == REJECTED:
-
-                rejected_signals.append(
-                    signal
-                )
-
-        # ====================================================
-        # RESUMEN
-        # ====================================================
-
-        print()
-
-        print(
-            "========================================"
-        )
-
-        print(
-            "RESUMEN"
-        )
-
-        print(
-            "========================================"
-        )
-
-        print(
-            f"Señales válidas:   "
-            f"{len(valid_signals)}"
-        )
-
-        print(
-            f"Señales rechazadas:"
-            f" {len(rejected_signals)}"
-        )
-
-        # ----------------------------------------------------
-        # VÁLIDAS
-        # ----------------------------------------------------
-
-        for index, signal in enumerate(
-            valid_signals,
-            start=1
-        ):
-
-            print()
-
-            print(
-                f"SEÑAL VÁLIDA {index}"
-            )
-
-            print(
-                f"Message-ID: "
-                f"{signal['message_id']}"
-            )
-
-            print(
-                f"UID:        "
-                f"{signal['email_uid']}"
-            )
-
-            print(
-                f"Asunto:     "
-                f"{signal['subject']}"
-            )
-
-            print(
-                f"Acciones:   "
-                f"{signal['actions']}"
-            )
-
-            print(
-                "Estado:     NEW"
-            )
-
-        # ----------------------------------------------------
-        # RECHAZADAS
-        # ----------------------------------------------------
-
-        for index, signal in enumerate(
-            rejected_signals,
-            start=1
-        ):
-
-            print()
-
-            print(
-                f"SEÑAL RECHAZADA {index}"
-            )
-
-            print(
-                f"Message-ID: "
-                f"{signal['message_id']}"
-            )
-
-            print(
-                f"UID:        "
-                f"{signal['email_uid']}"
-            )
-
-            print(
-                f"Asunto:     "
-                f"{signal['subject']}"
-            )
-
-            print(
-                f"Motivo:     "
-                f"{signal.get('error', 'N/A')}"
-            )
-
-            print(
-                "Estado:     REJECTED"
-            )
-
-        print()
-
-        print(
-            "Los correos siguen SIN LEER."
-        )
-
-        print(
-            "No se ha ejecutado ninguna orden."
-        )
-
-        print(
-            "========================================"
-        )
-
-    except Exception as error:
-
-        print()
-
-        print(
-            "========================================"
-        )
-
-        print(
-            "ERROR AL LEER GMAIL"
-        )
-
-        print(
-            "========================================"
-        )
-
-        print(
-            f"Tipo:    "
-            f"{type(error).__name__}"
-        )
-
-        print(
-            f"Mensaje: "
-            f"{error}"
-        )
-
-    finally:
-
-        if mail is not None:
-
-            try:
-
-                mail.logout()
-
-                print(
-                    "Conexión cerrada correctamente."
-                )
-
-            except Exception:
-
-                pass
-
-
-# ============================================================
-# INICIO
-# ============================================================
-
-if __name__ == "__main__":
-
-    main()
+    return email_uids
