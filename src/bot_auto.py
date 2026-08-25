@@ -1,10 +1,7 @@
 import imaplib
 import os
-import smtplib
 import threading
 import time
-
-from email.mime.text import MIMEText
 
 from dotenv import load_dotenv
 
@@ -46,16 +43,6 @@ from bot_state import (
     RECONNECTING_GMAIL,
     SAFETY_LOCK,
     STOPPING,
-)
-
-from control_email import (
-    get_control_emails,
-    read_control_email,
-    mark_control_as_read,
-)
-
-from control_executor import (
-    ControlExecutor,
 )
 
 
@@ -106,27 +93,6 @@ IB_CLIENT_ID = 4
 
 SIGNAL_SENDER = (
     "operativadax@gmail.com"
-)
-
-
-# ============================================================
-# CORREO DE CONTROL
-# ============================================================
-
-CONTROL_RESPONSE_TO = os.getenv(
-    "CONTROL_EMAIL"
-)
-
-SMTP_SERVER = os.getenv(
-    "SMTP_SERVER",
-    "smtp.gmail.com"
-)
-
-SMTP_PORT = int(
-    os.getenv(
-        "SMTP_PORT",
-        "465"
-    )
 )
 
 
@@ -399,7 +365,7 @@ def reconnect_gmail(
             bot_state.set_gmail_connected(True)
 
             # Antes de READY comprobamos que IBKR sigue conectado.
-            if not ib_app.is_connected():
+            if not ib_app.is_trading_connection_ready():
 
                 log_warning(
                     "Gmail reconectado pero IBKR no está conectado. Se mantiene estado de reconexión."
@@ -498,7 +464,7 @@ def ensure_gmail_connection(
                 "IMAP NOOP devolvió un estado no OK."
             )
 
-        if not ib_app.is_connected():
+        if not ib_app.is_trading_connection_ready():
             return mail
 
         return mail
@@ -726,256 +692,6 @@ def reconnect_ibkr(
             time.sleep(
                 IBKR_RECONNECT_INTERVAL
             )
-
-
-# ============================================================
-# ENVIAR RESPUESTA DE CONTROL
-# ============================================================
-
-def send_control_response(
-    result
-):
-
-    recipient = CONTROL_RESPONSE_TO
-
-    if not recipient:
-
-        log_error(
-            "CONTROL_EMAIL no está configurado; "
-            "no se puede enviar respuesta de control."
-        )
-
-        return False
-
-    subject = result.get(
-        "subject",
-        "DAX BOT - Control"
-    )
-
-    body = result.get(
-        "body",
-        ""
-    )
-
-    message = MIMEText(
-        body,
-        "plain",
-        "utf-8"
-    )
-
-    message["From"] = GMAIL_USER
-    message["To"] = recipient
-    message["Subject"] = subject
-
-    try:
-
-        with smtplib.SMTP_SSL(
-            SMTP_SERVER,
-            SMTP_PORT
-        ) as smtp:
-
-            smtp.login(
-                GMAIL_USER,
-                GMAIL_APP_PASSWORD
-            )
-
-            smtp.sendmail(
-                GMAIL_USER,
-                recipient,
-                message.as_string()
-            )
-
-        log_info(
-            f"Respuesta de control enviada | "
-            f"Subject={subject}"
-        )
-
-        print(
-            f"Respuesta de control enviada: {subject}"
-        )
-
-        return True
-
-    except Exception as error:
-
-        log_error(
-            f"Error enviando respuesta de control | "
-            f"{type(error).__name__}: {error}"
-        )
-
-        return False
-
-
-# ============================================================
-# PROCESAR CONTROL
-# ============================================================
-
-def process_control_messages(
-    mail,
-    control_executor
-):
-    """
-    Procesa únicamente consultas de control.
-
-    En esta fase: 
-        STATUS      -> activo
-        POSITIONS   -> activo
-        ACCOUNT     -> activo si PaperExecutor dispone de
-                       la capa AccountSummary.
-
-    Las órdenes manuales se reconocen, pero todavía no se
-    ejecutan desde bot_auto.
-    """
-
-    control_uids = get_control_emails(
-        mail
-    )
-
-    if not control_uids:
-
-        return True
-
-    for email_uid in control_uids:
-
-        control = read_control_email(
-            mail,
-            email_uid
-        )
-
-        if control is None:
-            continue
-
-        if not control.get(
-            "valid",
-            False
-        ):
-
-            result = {
-                "subject": "DAX BOT - Control rechazado",
-                "body": (
-                    "COMANDO DE CONTROL RECHAZADO\n\n"
-                    f"Motivo: {control.get('reason', 'Desconocido')}\n\n"
-                    "No se ha realizado ninguna operación."
-                )
-            }
-
-            send_control_response(
-                result
-            )
-
-            mark_control_as_read(
-                mail,
-                email_uid
-            )
-
-            continue
-
-        command_type = control.get(
-            "command_type"
-        )
-
-        command = control.get(
-            "command"
-        )
-
-        # ----------------------------------------------------
-        # Consultas
-        # ----------------------------------------------------
-
-        if command_type == "COMMAND" and command in (
-            "STATUS",
-            "POSITIONS",
-            "ACCOUNT",
-        ):
-
-            result = control_executor.execute(
-                command
-            )
-
-            send_control_response(
-                result
-            )
-
-            mark_control_as_read(
-                mail,
-                email_uid
-            )
-
-            continue
-
-        # ----------------------------------------------------
-        # Operaciones manuales todavía no activadas en bot_auto
-        # ----------------------------------------------------
-
-        if command_type == "COMMAND" and command in (
-            "OPEN LONG",
-            "CLOSE LONG",
-            "OPEN SHORT",
-            "CLOSE SHORT",
-        ):
-
-            result = {
-                "subject": "DAX BOT - Control manual",
-                "body": (
-                    "OPERACIÓN MANUAL RECIBIDA\n\n"
-                    f"Solicitud: {command}\n\n"
-                    "Las operaciones manuales por correo "
-                    "todavía no están habilitadas en bot_auto.\n\n"
-                    "No se ha enviado ninguna orden."
-                )
-            }
-
-            log_warning(
-                f"Operación manual recibida pero no activada | "
-                f"Command={command} | "
-                f"Message-ID={control.get('message_id')}"
-            )
-
-            send_control_response(
-                result
-            )
-
-            mark_control_as_read(
-                mail,
-                email_uid
-            )
-
-            continue
-
-        # ----------------------------------------------------
-        # Confirmación todavía no activada
-        # ----------------------------------------------------
-
-        if command_type == "CONFIRM":
-
-            result = {
-                "subject": "DAX BOT - Confirmación no activa",
-                "body": (
-                    "CONFIRMACIÓN RECIBIDA\n\n"
-                    f"Código: {control.get('code')}\n\n"
-                    "La ejecución manual por correo todavía "
-                    "no está habilitada en bot_auto.\n\n"
-                    "No se ha enviado ninguna orden."
-                )
-            }
-
-            log_warning(
-                f"Confirmación recibida pero no activada | "
-                f"Code={control.get('code')}"
-            )
-
-            send_control_response(
-                result
-            )
-
-            mark_control_as_read(
-                mail,
-                email_uid
-            )
-
-            continue
-
-    return True
 
 
 # ============================================================
@@ -2347,10 +2063,6 @@ def run():
             )
         )
 
-        control_executor = ControlExecutor(
-            ib_app
-        )
-
         print()
         print(
             "========================================"
@@ -2490,35 +2202,6 @@ def run():
                     )
 
                     return
-
-                # ------------------------------------------------
-                # PROCESAR CORREOS DE CONTROL
-                # ------------------------------------------------
-
-                try:
-
-                    if not process_control_messages(
-                        mail,
-                        control_executor
-                    ):
-
-                        bot_state.set_status(
-                            SAFETY_LOCK
-                        )
-
-                        return
-
-                except Exception as error:
-
-                    log_warning(
-                        f"Error procesando control por correo | "
-                        f"{type(error).__name__}: {error}"
-                    )
-
-                    # El fallo de un correo de control no debe bloquear
-                    # automáticamente las señales normales. Si además
-                    # se ha perdido Gmail, ensure_gmail_connection lo
-                    # detectará en el siguiente ciclo.
 
                 # ------------------------------------------------
                 # Buscar correos.
