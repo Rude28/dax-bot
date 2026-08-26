@@ -1,7 +1,10 @@
 import imaplib
 import os
+import smtplib
 import threading
 import time
+
+from email.mime.text import MIMEText
 
 from dotenv import load_dotenv
 
@@ -43,6 +46,16 @@ from bot_state import (
     RECONNECTING_GMAIL,
     SAFETY_LOCK,
     STOPPING,
+)
+
+from control_email import (
+    get_control_emails,
+    read_control_email,
+    mark_control_as_read,
+)
+
+from control_executor import (
+    ControlExecutor,
 )
 
 
@@ -97,6 +110,27 @@ SIGNAL_SENDER = (
 
 
 # ============================================================
+# CORREO DE CONTROL
+# ============================================================
+
+CONTROL_RESPONSE_TO = os.getenv(
+    "CONTROL_EMAIL"
+)
+
+SMTP_SERVER = os.getenv(
+    "SMTP_SERVER",
+    "smtp.gmail.com"
+)
+
+SMTP_PORT = int(
+    os.getenv(
+        "SMTP_PORT",
+        "465"
+    )
+)
+
+
+# ============================================================
 # INTERVALO DE COMPROBACIÓN
 # ============================================================
 
@@ -112,9 +146,6 @@ GMAIL_RECONNECT_TIMEOUT = 10
 # ============================================================
 
 state_manager = SignalState()
-
-bot_state.mark_started()
-bot_state.set_status(STARTING)
 
 
 # ============================================================
@@ -230,105 +261,153 @@ def create_ib_executor():
 # ============================================================
 
 def create_mail_connection():
+    """Crea y valida una conexión IMAP nueva."""
 
     print()
-    print(
-        "========================================"
-    )
+    print("========================================")
+    print("CONECTANDO CON GMAIL")
+    print("========================================")
 
-    print(
-        "CONECTANDO CON GMAIL"
-    )
+    if not GMAIL_USER:
+        raise RuntimeError("Falta GMAIL_USER.")
 
-    print(
-        "========================================"
-    )
+    if not GMAIL_APP_PASSWORD:
+        raise RuntimeError("Falta GMAIL_APP_PASSWORD.")
 
-    mail = imaplib.IMAP4_SSL(
-        IMAP_SERVER,
-        IMAP_PORT
-    )
+    mail = None
 
-    mail.login(
-        GMAIL_USER,
-        GMAIL_APP_PASSWORD
-    )
-
-    status, _ = mail.select(
-        "INBOX"
-    )
-
-    if status != "OK":
-
-        raise RuntimeError(
-            "No se pudo abrir INBOX."
+    try:
+        mail = imaplib.IMAP4_SSL(
+            IMAP_SERVER,
+            IMAP_PORT,
+            timeout=GMAIL_RECONNECT_TIMEOUT
         )
 
-    print(
-        "Gmail preparado correctamente."
+        mail.login(
+            GMAIL_USER,
+            GMAIL_APP_PASSWORD
+        )
+
+        status, _ = mail.select("INBOX")
+
+        if status != "OK":
+            raise RuntimeError(
+                "No se pudo abrir INBOX."
+            )
+
+        noop_status, _ = mail.noop()
+
+        if noop_status != "OK":
+            raise RuntimeError(
+                "Gmail respondió incorrectamente al NOOP."
+            )
+
+        bot_state.set_gmail_connected(True)
+        log_info("Conexión Gmail establecida y validada.")
+
+        print("Gmail preparado correctamente.")
+
+        return mail
+
+    except Exception:
+        bot_state.set_gmail_connected(False)
+
+        if mail is not None:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+
+        raise
+
+
+# ============================================================
+# UTILIDADES DE CONEXIÓN
+# ============================================================
+
+def _ibkr_connected(ib_app):
+    """Comprueba la conexión real de ibapi sin asumir APIs de otro cliente."""
+
+    if ib_app is None:
+        return False
+
+    try:
+        if hasattr(ib_app, "isConnected"):
+            return bool(ib_app.isConnected())
+
+        if hasattr(ib_app, "is_trading_connection_ready"):
+            return bool(
+                ib_app.is_trading_connection_ready()
+            )
+
+    except Exception as error:
+        log_warning(
+            f"Error comprobando conexión IBKR | "
+            f"{type(error).__name__}: {error}"
+        )
+
+    return False
+
+
+def _set_ready_if_safe(ib_app):
+    """READY solo si IBKR y Gmail están conectados y no hay PROCESSING."""
+
+    state = bot_state.snapshot()
+
+    if not state.get("gmail_connected", False):
+        return False
+
+    if not _ibkr_connected(ib_app):
+        return False
+
+    processing = state_manager.get_processing_signals()
+
+    if processing:
+        return False
+
+    bot_state.set_position(
+        ib_app.get_position()
     )
 
-    log_info(
-        "Conexión Gmail establecida."
-    )
-
-    bot_state.set_gmail_connected(True)
-
-    return mail
+    bot_state.set_status(READY)
+    return True
 
 
 # ============================================================
 # RECONEXIÓN GMAIL
 # ============================================================
 
-def reconnect_gmail(
-    mail,
-    ib_app
-):
+def reconnect_gmail(mail, ib_app):
     """
-    Recupera la conexión IMAP de Gmail de forma segura.
+    Recupera IMAP de Gmail sin dar por buena la conexión hasta
+    autenticar, abrir INBOX y responder a NOOP.
 
-    Durante la reconexión no se procesan señales.
-    Se crea una conexión nueva, se autentica y se selecciona INBOX
-    antes de volver al estado READY.
+    IMPORTANTE:
+    Gmail e IBKR se validan de forma independiente. Gmail no se
+    considera reconectado si IMAP no responde; y READY solo se
+    recupera cuando ambas conexiones están disponibles.
     """
 
     attempt = 0
 
     while True:
-
         attempt += 1
 
-        bot_state.set_status(
-            RECONNECTING_GMAIL
-        )
-
-        bot_state.set_gmail_connected(
-            False
-        )
+        bot_state.set_status(RECONNECTING_GMAIL)
+        bot_state.set_gmail_connected(False)
 
         print()
-        print(
-            "========================================"
-        )
-        print(
-            "RECONEXIÓN GMAIL"
-        )
-        print(
-            f"Intento: {attempt}"
-        )
-        print(
-            "========================================"
-        )
+        print("========================================")
+        print("RECONEXIÓN GMAIL")
+        print(f"Intento: {attempt}")
+        print("========================================")
 
         log_warning(
             f"Intentando reconectar Gmail | Intento={attempt}"
         )
 
         try:
-
             if mail is not None:
-
                 try:
                     mail.logout()
                 except Exception:
@@ -345,118 +424,103 @@ def reconnect_gmail(
                 GMAIL_APP_PASSWORD
             )
 
-            status, _ = new_mail.select(
-                "INBOX"
-            )
+            status, _ = new_mail.select("INBOX")
 
             if status != "OK":
                 raise RuntimeError(
                     "No se pudo abrir INBOX tras reconectar Gmail."
                 )
 
-            # Verificación explícita de que IMAP responde.
             noop_status, _ = new_mail.noop()
 
             if noop_status != "OK":
                 raise RuntimeError(
-                    "Gmail respondió incorrectamente al NOOP."
+                    "Gmail respondió incorrectamente al NOOP tras reconectar."
                 )
 
             bot_state.set_gmail_connected(True)
 
-            # Antes de READY comprobamos que IBKR sigue conectado.
-            if not ib_app.is_trading_connection_ready():
+            log_info(
+                f"Gmail reconectado a nivel IMAP | Intento={attempt}"
+            )
 
+            # Si IBKR está desconectado, Gmail sigue siendo válido,
+            # pero no declaramos READY ni procesamos operaciones.
+            if not _ibkr_connected(ib_app):
                 log_warning(
-                    "Gmail reconectado pero IBKR no está conectado. Se mantiene estado de reconexión."
+                    "Gmail reconectado pero IBKR sigue desconectado. "
+                    "Gmail queda disponible; el bot espera a IBKR."
                 )
 
-                try:
-                    new_mail.logout()
-                except Exception:
-                    pass
+                bot_state.set_status(
+                    RECONNECTING_IBKR
+                )
 
-                bot_state.set_gmail_connected(False)
-                time.sleep(GMAIL_RECONNECT_INTERVAL)
-                continue
+                return new_mail
 
-            # Si existe PROCESSING, no reanudamos directamente la lectura
-            # de nuevas señales. Primero reconciliamos.
+            # Si había PROCESSING, reconciliamos antes de READY.
             processing = state_manager.get_processing_signals()
 
             if processing:
-
-                print()
-                print(
-                    "PROCESSING DETECTADO TRAS RECONEXIÓN DE GMAIL."
-                )
-
+                print("PROCESSING DETECTADO TRAS RECONEXIÓN DE GMAIL.")
                 log_warning(
-                    f"PROCESSING tras reconexión Gmail | Cantidad={len(processing)}"
+                    f"PROCESSING tras reconexión Gmail | "
+                    f"Cantidad={len(processing)}"
                 )
 
                 if not reconcile_processing_signals(
                     ib_app,
                     new_mail
                 ):
-
-                    bot_state.set_status(
-                        SAFETY_LOCK
-                    )
-
+                    bot_state.set_status(SAFETY_LOCK)
                     log_error(
                         "No se pudo reconciliar PROCESSING tras reconexión Gmail."
                     )
-
+                    try:
+                        new_mail.logout()
+                    except Exception:
+                        pass
+                    bot_state.set_gmail_connected(False)
                     return None
 
-            bot_state.set_position(
-                ib_app.get_position()
-            )
+            if not _set_ready_if_safe(ib_app):
+                log_warning(
+                    "Gmail reconectado pero el bot no puede pasar a READY."
+                )
+                return new_mail
 
-            bot_state.set_status(
-                READY
-            )
-
+            print("GMAIL RECONECTADO CORRECTAMENTE.")
             log_info(
-                f"Gmail reconectado y validado | Position={ib_app.get_position()}"
-            )
-
-            print()
-            print(
-                "GMAIL RECONECTADO CORRECTAMENTE."
+                f"Gmail reconectado y validado | "
+                f"Position={ib_app.get_position()}"
             )
 
             return new_mail
 
         except Exception as error:
-
-            bot_state.set_error(
-                error
-            )
+            bot_state.set_gmail_connected(False)
+            bot_state.set_error(error)
 
             log_warning(
                 f"Error reconectando Gmail | Intento={attempt} | "
                 f"{type(error).__name__}: {error}"
             )
 
-            time.sleep(
-                GMAIL_RECONNECT_INTERVAL
-            )
+            time.sleep(GMAIL_RECONNECT_INTERVAL)
 
 
 # ============================================================
 # COMPROBAR CONEXIÓN GMAIL
 # ============================================================
 
-def ensure_gmail_connection(
-    mail,
-    ib_app
-):
-    """Comprueba IMAP y reconecta si la conexión no responde."""
+def ensure_gmail_connection(mail, ib_app):
+    """Comprueba IMAP de forma activa y devuelve una conexión válida."""
+
+    if mail is None:
+        log_warning("No existe conexión Gmail; iniciando reconexión.")
+        return reconnect_gmail(None, ib_app)
 
     try:
-
         status, _ = mail.noop()
 
         if status != "OK":
@@ -464,32 +528,30 @@ def ensure_gmail_connection(
                 "IMAP NOOP devolvió un estado no OK."
             )
 
-        if not ib_app.is_trading_connection_ready():
-            return mail
+        # La conexión IMAP está viva. Solo reflejamos su estado.
+        if not bot_state.snapshot().get("gmail_connected", False):
+            bot_state.set_gmail_connected(True)
 
         return mail
 
     except Exception as error:
-
         bot_state.set_gmail_connected(False)
         bot_state.set_error(error)
+
         log_warning(
             f"Gmail desconectado detectado | "
             f"{type(error).__name__}: {error}"
         )
 
         print()
-        print(
-            "GMAIL DESCONECTADO."
-        )
-        print(
-            "No se procesarán señales hasta reconectar."
-        )
+        print("GMAIL DESCONECTADO.")
+        print("No se procesarán correos hasta reconectar.")
 
         return reconnect_gmail(
             mail,
             ib_app
         )
+
 
 
 # ============================================================
@@ -667,13 +729,16 @@ def reconnect_ibkr(
 
                     return False
 
-            bot_state.set_status(
-                READY
-            )
-
-            log_info(
-                "IBKR reconectado y validado. Estado READY."
-            )
+            if bot_state.snapshot().get("gmail_connected", False):
+                bot_state.set_status(READY)
+                log_info(
+                    "IBKR reconectado y validado. Estado READY."
+                )
+            else:
+                bot_state.set_status(RECONNECTING_GMAIL)
+                log_info(
+                    "IBKR reconectado; esperando reconexión Gmail antes de READY."
+                )
 
             return True
 
@@ -692,6 +757,328 @@ def reconnect_ibkr(
             time.sleep(
                 IBKR_RECONNECT_INTERVAL
             )
+
+
+# ============================================================
+# ENVIAR RESPUESTA DE CONTROL
+# ============================================================
+
+def send_control_response(
+    result
+):
+
+    recipient = CONTROL_RESPONSE_TO
+
+    if not recipient:
+
+        log_error(
+            "CONTROL_EMAIL no está configurado; "
+            "no se puede enviar respuesta de control."
+        )
+
+        return False
+
+    subject = result.get(
+        "subject",
+        "DAX BOT - Control"
+    )
+
+    body = result.get(
+        "body",
+        ""
+    )
+
+    message = MIMEText(
+        body,
+        "plain",
+        "utf-8"
+    )
+
+    message["From"] = GMAIL_USER
+    message["To"] = recipient
+    message["Subject"] = subject
+
+    try:
+
+        with smtplib.SMTP_SSL(
+            SMTP_SERVER,
+            SMTP_PORT
+        ) as smtp:
+
+            smtp.login(
+                GMAIL_USER,
+                GMAIL_APP_PASSWORD
+            )
+
+            smtp.sendmail(
+                GMAIL_USER,
+                recipient,
+                message.as_string()
+            )
+
+        log_info(
+            f"Respuesta de control enviada | "
+            f"Subject={subject}"
+        )
+
+        print(
+            f"Respuesta de control enviada: {subject}"
+        )
+
+        return True
+
+    except Exception as error:
+
+        log_error(
+            f"Error enviando respuesta de control | "
+            f"{type(error).__name__}: {error}"
+        )
+
+        return False
+
+
+# ============================================================
+# MAPA DE OPERACIONES MANUALES
+# ============================================================
+
+MANUAL_ACTIONS = {
+    "OPEN LONG": "ABRIR_LARGO",
+    "CLOSE LONG": "CERRAR_LARGO",
+    "OPEN SHORT": "ABRIR_CORTO",
+    "CLOSE SHORT": "CERRAR_CORTO",
+}
+
+
+def build_manual_control_response(result, command):
+    """Construye la respuesta específica de una orden manual."""
+
+    if not result:
+        return {
+            "subject": "DAX BOT - Operación manual",
+            "body": (
+                f"Operación: {command}\n\n"
+                "No se recibió un resultado de ejecución."
+            ),
+        }
+
+    success = result.get("success", False)
+    status = result.get("status", "UNKNOWN")
+    position = result.get("position", "N/A")
+    price = result.get("price", "N/A")
+    order_id = result.get("order_id", "N/A")
+    filled = result.get("filled", 0.0)
+    error = result.get("error")
+
+    if success:
+        subject = "DAX BOT - Operación manual realizada"
+        headline = "OPERACIÓN MANUAL REALIZADA"
+    elif status == "PARTIAL":
+        subject = "DAX BOT - Operación manual parcial"
+        headline = "OPERACIÓN MANUAL PARCIAL"
+    else:
+        subject = "DAX BOT - Operación manual fallida"
+        headline = "OPERACIÓN MANUAL NO REALIZADA"
+
+    lines = [
+        headline,
+        "================================",
+        "",
+        f"Operación: {command}",
+        f"Estado: {status}",
+        f"Order ID: {order_id}",
+        f"Ejecutado: {filled}",
+        f"Precio: {price}",
+        f"Posición final: {position}",
+    ]
+
+    if error:
+        lines.extend(["", f"Error: {error}"])
+
+    return {
+        "subject": subject,
+        "body": "\n".join(lines),
+    }
+
+
+def process_control_messages(
+    mail,
+    control_executor,
+    signal_executor
+):
+    """Procesa consultas y órdenes manuales directas."""
+
+    control_uids = get_control_emails(
+        mail
+    )
+
+    if not control_uids:
+        return True
+
+    for email_uid in control_uids:
+
+        control = read_control_email(
+            mail,
+            email_uid
+        )
+
+        if control is None:
+            continue
+
+        if not control.get("valid", False):
+            send_control_response({
+                "subject": "DAX BOT - Control rechazado",
+                "body": (
+                    "COMANDO DE CONTROL RECHAZADO\n\n"
+                    f"Motivo: {control.get('reason', 'Desconocido')}\n\n"
+                    "No se ha realizado ninguna operación."
+                )
+            })
+            mark_control_as_read(mail, email_uid)
+            continue
+
+        command_type = control.get("command_type")
+        command = control.get("command")
+
+        # ----------------------------------------------------
+        # Consultas
+        # ----------------------------------------------------
+        if command_type == "COMMAND" and command in (
+            "STATUS",
+            "POSITIONS",
+            "ACCOUNT",
+        ):
+
+            result = control_executor.execute(
+                command
+            )
+
+            send_control_response(result)
+            mark_control_as_read(mail, email_uid)
+            continue
+
+        # ----------------------------------------------------
+        # Orden manual DIRECTA
+        # ----------------------------------------------------
+        if command_type == "COMMAND" and command in MANUAL_ACTIONS:
+
+            validation = control_executor.execute_manual_command(
+                control
+            )
+
+            if not validation.get("success", False):
+                send_control_response({
+                    "subject": "DAX BOT - Operación manual bloqueada",
+                    "body": validation.get(
+                        "body",
+                        "No se ha enviado ninguna orden."
+                    ),
+                })
+                mark_control_as_read(mail, email_uid)
+                continue
+
+            manual_signal = validation.get("signal")
+
+            if not manual_signal:
+                log_error(
+                    f"ControlExecutor no devolvió señal manual | "
+                    f"Command={command}"
+                )
+                send_control_response({
+                    "subject": "DAX BOT - Error operación manual",
+                    "body": "No se ha generado la señal manual.\n\nNo se ha enviado ninguna orden.",
+                })
+                mark_control_as_read(mail, email_uid)
+                continue
+
+            manual_message_id = manual_signal[
+                "message_id"
+            ]
+
+            # ------------------------------------------------
+            # Registrar NEW antes de pasar al flujo normal.
+            # Esto soluciona el problema que vimos con Status=None.
+            # ------------------------------------------------
+            state_manager.set_status(
+                manual_message_id,
+                NEW,
+                email_uid=manual_signal.get("email_uid"),
+                sender=manual_signal.get("sender"),
+                subject=manual_signal.get("subject"),
+                date=manual_signal.get("date"),
+                actions=manual_signal.get("actions", []),
+                valid=True,
+                manual=True,
+                manual_command=command,
+                position_initial=validation.get("position"),
+                expected_final_position=(
+                    validation.get("expected_position")
+                ),
+                operations=[]
+            )
+
+            log_info(
+                f"Orden manual registrada como NEW | "
+                f"Message-ID={manual_message_id} | "
+                f"Command={command} | "
+                f"Actions={manual_signal.get('actions')}"
+            )
+
+            try:
+                result = process_valid_signal(
+                    mail,
+                    manual_signal,
+                    signal_executor
+                )
+
+            except Exception as error:
+                log_error(
+                    f"Error ejecutando operación manual | "
+                    f"Message-ID={manual_message_id} | "
+                    f"{type(error).__name__}: {error}"
+                )
+
+                result = {
+                    "success": False,
+                    "status": "ERROR",
+                    "position": signal_executor.ib_app.get_position(),
+                    "price": 0.0,
+                    "filled": 0.0,
+                    "order_id": None,
+                    "error": str(error),
+                }
+
+            response = build_manual_control_response(
+                result,
+                command
+            )
+
+            send_control_response(response)
+
+            # Este correo ya se ha consumido como orden manual.
+            # El estado persistente evita reejecuciones.
+            mark_control_as_read(mail, email_uid)
+
+            continue
+
+        # CONFIRM ya no forma parte del sistema.
+        # control_email.py aún puede reconocerlo, pero lo rechazamos
+        # explícitamente para evitar un segundo paso accidental.
+        if command_type == "CONFIRM":
+            send_control_response({
+                "subject": "DAX BOT - Confirmación no necesaria",
+                "body": (
+                    "Las órdenes manuales ya no utilizan confirmación por código.\n\n"
+                    "Envía directamente uno de estos comandos:\n"
+                    "DAXCONTROL OPEN LONG\n"
+                    "DAXCONTROL CLOSE LONG\n"
+                    "DAXCONTROL OPEN SHORT\n"
+                    "DAXCONTROL CLOSE SHORT"
+                ),
+            })
+            mark_control_as_read(mail, email_uid)
+            continue
+
+    return True
 
 
 # ============================================================
@@ -1613,7 +2000,7 @@ def process_valid_signal(
             f"Status={current_status}"
         )
 
-        return
+        return None
 
     # --------------------------------------------------------
     # PROCESSING
@@ -1900,6 +2287,8 @@ def process_valid_signal(
             f"Estado={final_status}"
         )
 
+    return result
+
 
 # ============================================================
 # PROCESAR CORREO
@@ -2063,6 +2452,10 @@ def run():
             )
         )
 
+        control_executor = ControlExecutor(
+            ib_app
+        )
+
         print()
         print(
             "========================================"
@@ -2202,6 +2595,36 @@ def run():
                     )
 
                     return
+
+                # ------------------------------------------------
+                # PROCESAR CORREOS DE CONTROL
+                # ------------------------------------------------
+
+                try:
+
+                    if not process_control_messages(
+                        mail,
+                        control_executor,
+                        signal_executor
+                    ):
+
+                        bot_state.set_status(
+                            SAFETY_LOCK
+                        )
+
+                        return
+
+                except Exception as error:
+
+                    log_warning(
+                        f"Error procesando control por correo | "
+                        f"{type(error).__name__}: {error}"
+                    )
+
+                    # El fallo de un correo de control no debe bloquear
+                    # automáticamente las señales normales. Si además
+                    # se ha perdido Gmail, ensure_gmail_connection lo
+                    # detectará en el siguiente ciclo.
 
                 # ------------------------------------------------
                 # Buscar correos.

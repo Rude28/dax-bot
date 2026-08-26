@@ -1,1 +1,24 @@
-{}
+{
+    "450596": {
+        "code": "450596",
+        "status": "USED",
+        "command": "CLOSE LONG",
+        "email_uid": "69737",
+        "message_id": "<CA+KYRPj+7sgCdE2Ek3U_yp_CvbJ5Kpdeo36qKOA4tF5SXo8USA@mail.gmail.com>",
+        "sender": "Gabriel Ríos Torres <riostorresgabriel97@gmail.com>",
+        "subject": "DAXCONTROL CLOSE LONG",
+        "quantity": 1,
+        "position_at_request": 1.0,
+        "expected_position": 0.0,
+        "created_at": 1787758619.364025,
+        "expires_at": 1787758679.364025,
+        "used_at": 1787758664.557329,
+        "expired_at": null,
+        "cancelled_at": null,
+        "cancel_reason": null,
+        "metadata": {
+            "trading_mode": "PAPER",
+            "ibkr_action": "SELL"
+        }
+    }
+}

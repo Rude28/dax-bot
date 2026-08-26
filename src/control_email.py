@@ -16,7 +16,7 @@ from logger import (
 
 # IMPORTANTE:
 # Sustituye esta dirección por tu correo REAL de control.
-CONTROL_EMAIL = "gaboriel16@gmail.com"
+CONTROL_EMAIL = "riostorresgabriel97@gmail.com"
 
 CONTROL_KEYWORD = "DAXCONTROL"
 

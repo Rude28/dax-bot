@@ -24,10 +24,23 @@ CONFIRMATION_TTL = 60
 PENDING = "PENDING"
 USED = "USED"
 EXPIRED = "EXPIRED"
+CANCELLED = "CANCELLED"
 
 
 # ============================================================
-# GESTOR DE CONFIRMACIONES
+# COMANDOS MANUALES
+# ============================================================
+
+MANUAL_COMMANDS = {
+    "OPEN LONG",
+    "CLOSE LONG",
+    "OPEN SHORT",
+    "CLOSE SHORT",
+}
+
+
+# ============================================================
+# GESTOR DE COMANDOS PENDIENTES
 # ============================================================
 
 class PendingCommandManager:
@@ -37,8 +50,8 @@ class PendingCommandManager:
         ttl_seconds=CONFIRMATION_TTL
     ):
 
-        self.ttl_seconds = (
-            int(ttl_seconds)
+        self.ttl_seconds = int(
+            ttl_seconds
         )
 
         self._lock = (
@@ -57,7 +70,9 @@ class PendingCommandManager:
     # DIRECTORIO
     # ========================================================
 
-    def _ensure_directory(self):
+    def _ensure_directory(
+        self
+    ):
 
         directory = os.path.dirname(
             PENDING_FILE
@@ -71,10 +86,12 @@ class PendingCommandManager:
             )
 
     # ========================================================
-    # LEER
+    # LEER ARCHIVO
     # ========================================================
 
-    def _load_all(self):
+    def _load_all(
+        self
+    ):
 
         try:
 
@@ -105,7 +122,7 @@ class PendingCommandManager:
             return {}
 
     # ========================================================
-    # GUARDAR
+    # GUARDAR ARCHIVO
     # ========================================================
 
     def _save_all(
@@ -116,7 +133,8 @@ class PendingCommandManager:
         self._ensure_directory()
 
         temporary_file = (
-            PENDING_FILE + ".tmp"
+            PENDING_FILE
+            + ".tmp"
         )
 
         with open(
@@ -180,6 +198,10 @@ class PendingCommandManager:
                         "status"
                     ] = EXPIRED
 
+                    command[
+                        "expired_at"
+                    ] = now
+
                     changed = True
 
             if changed:
@@ -210,8 +232,26 @@ class PendingCommandManager:
                 return code
 
         raise RuntimeError(
-            "No se pudo generar un código "
-            "de confirmación único."
+            "No se pudo generar un "
+            "código de confirmación único."
+        )
+
+    # ========================================================
+    # VALIDAR COMANDO
+    # ========================================================
+
+    @staticmethod
+    def is_manual_command(
+        command
+    ):
+
+        if not command:
+
+            return False
+
+        return (
+            command.strip().upper()
+            in MANUAL_COMMANDS
         )
 
     # ========================================================
@@ -230,6 +270,37 @@ class PendingCommandManager:
         quantity=1,
         metadata=None
     ):
+        """
+        Crea una solicitud manual pendiente.
+
+        NO ejecuta ninguna orden.
+        """
+
+        command = (
+            str(command)
+            .strip()
+            .upper()
+        )
+
+        # ----------------------------------------------------
+        # Validación
+        # ----------------------------------------------------
+
+        if not self.is_manual_command(
+            command
+        ):
+
+            raise ValueError(
+                f"Comando manual no válido: "
+                f"{command}"
+            )
+
+        if int(quantity) != 1:
+
+            raise ValueError(
+                "El MVP solo permite "
+                "1 contrato."
+            )
 
         self.cleanup_expired()
 
@@ -238,6 +309,39 @@ class PendingCommandManager:
         with self._lock:
 
             data = self._load_all()
+
+            # ------------------------------------------------
+            # Evitar múltiples confirmaciones simultáneas
+            # de la misma operación.
+            # ------------------------------------------------
+
+            for existing_code, existing in (
+                data.items()
+            ):
+
+                if existing.get(
+                    "status"
+                ) != PENDING:
+
+                    continue
+
+                if (
+                    existing.get(
+                        "command"
+                    ) == command
+                    and existing.get(
+                        "sender"
+                    ) == sender
+                ):
+
+                    raise RuntimeError(
+                        "Ya existe una solicitud "
+                        "pendiente para esta operación."
+                    )
+
+            # ------------------------------------------------
+            # Generar código
+            # ------------------------------------------------
 
             code = self._generate_code(
                 data
@@ -255,7 +359,7 @@ class PendingCommandManager:
                     command,
 
                 "email_uid":
-                    email_uid,
+                    str(email_uid),
 
                 "message_id":
                     message_id,
@@ -267,7 +371,7 @@ class PendingCommandManager:
                     subject,
 
                 "quantity":
-                    quantity,
+                    int(quantity),
 
                 "position_at_request":
                     float(
@@ -289,13 +393,24 @@ class PendingCommandManager:
                 "used_at":
                     None,
 
+                "expired_at":
+                    None,
+
+                "cancelled_at":
+                    None,
+
+                "cancel_reason":
+                    None,
+
                 "metadata":
                     metadata
                     if metadata
                     else {}
             }
 
-            data[code] = pending
+            data[
+                code
+            ] = pending
 
             self._save_all(
                 data
@@ -306,7 +421,7 @@ class PendingCommandManager:
             )
 
     # ========================================================
-    # BUSCAR
+    # OBTENER SOLICITUD
     # ========================================================
 
     def get(
@@ -337,13 +452,19 @@ class PendingCommandManager:
             )
 
     # ========================================================
-    # CONFIRMAR
+    # CONSUMIR CÓDIGO
     # ========================================================
 
     def mark_used(
         self,
         code
     ):
+        """
+        Marca el código como USED.
+
+        Debe llamarse justo antes de ejecutar
+        la operación para impedir reutilización.
+        """
 
         code = str(
             code
@@ -361,6 +482,10 @@ class PendingCommandManager:
 
                 return None
 
+            # ------------------------------------------------
+            # Solo PENDING puede pasar a USED.
+            # ------------------------------------------------
+
             if command.get(
                 "status"
             ) != PENDING:
@@ -368,6 +493,37 @@ class PendingCommandManager:
                 return dict(
                     command
                 )
+
+            # ------------------------------------------------
+            # Comprobar caducidad nuevamente.
+            # ------------------------------------------------
+
+            if time.time() >= float(
+                command.get(
+                    "expires_at",
+                    0
+                )
+            ):
+
+                command[
+                    "status"
+                ] = EXPIRED
+
+                command[
+                    "expired_at"
+                ] = time.time()
+
+                self._save_all(
+                    data
+                )
+
+                return dict(
+                    command
+                )
+
+            # ------------------------------------------------
+            # Consumir.
+            # ------------------------------------------------
 
             command[
                 "status"
@@ -411,13 +567,27 @@ class PendingCommandManager:
 
                 return None
 
+            if command.get(
+                "status"
+            ) != PENDING:
+
+                return dict(
+                    command
+                )
+
             command[
                 "status"
-            ] = EXPIRED
+            ] = CANCELLED
+
+            command[
+                "cancelled_at"
+            ] = time.time()
 
             command[
                 "cancel_reason"
-            ] = reason
+            ] = str(
+                reason
+            )
 
             self._save_all(
                 data
@@ -428,7 +598,7 @@ class PendingCommandManager:
             )
 
     # ========================================================
-    # SNAPSHOT
+    # TODOS LOS COMANDOS
     # ========================================================
 
     def all(
@@ -440,6 +610,80 @@ class PendingCommandManager:
         with self._lock:
 
             return self._load_all()
+
+    # ========================================================
+    # SOLICITUDES PENDIENTES
+    # ========================================================
+
+    def get_pending(
+        self
+    ):
+
+        self.cleanup_expired()
+
+        with self._lock:
+
+            data = self._load_all()
+
+            return {
+                code: dict(command)
+
+                for code, command
+                in data.items()
+
+                if command.get(
+                    "status"
+                ) == PENDING
+            }
+
+    # ========================================================
+    # COMPROBAR EXISTENCIA
+    # ========================================================
+
+    def has_pending_for_sender(
+        self,
+        sender
+    ):
+
+        sender = (
+            str(sender)
+            .strip()
+            .lower()
+        )
+
+        self.cleanup_expired()
+
+        with self._lock:
+
+            data = self._load_all()
+
+            for command in data.values():
+
+                if command.get(
+                    "status"
+                ) != PENDING:
+
+                    continue
+
+                existing_sender = (
+                    str(
+                        command.get(
+                            "sender",
+                            ""
+                        )
+                    )
+                    .strip()
+                    .lower()
+                )
+
+                if (
+                    existing_sender
+                    == sender
+                ):
+
+                    return True
+
+            return False
 
 
 # ============================================================

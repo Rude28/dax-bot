@@ -142,6 +142,20 @@ class PaperExecutor(EWrapper, EClient):
             threading.Event()
         )
 
+        # ====================================================
+        # CUENTA IBKR
+        # ====================================================
+
+        self.account_summary = {}
+
+        self.account_summary_event = (
+            threading.Event()
+        )
+
+        self.account_request_id = 10000
+
+        self.account_summary_currency = None
+
     # ========================================================
     # CONEXIÓN
     # ========================================================
@@ -719,6 +733,187 @@ class PaperExecutor(EWrapper, EClient):
                 f"Fin de consulta de ejecuciones | "
                 f"RequestID={reqId}"
             )
+
+    # ========================================================
+    # CUENTA IBKR
+    # ========================================================
+
+    def accountSummary(
+        self,
+        reqId,
+        account,
+        tag,
+        value,
+        currency
+    ):
+        """Recibe una fila del Account Summary de IBKR."""
+
+        if reqId != self.account_request_id:
+            return
+
+        self.account_summary[tag] = {
+            "value": value,
+            "currency": currency,
+            "account": account
+        }
+
+        if currency:
+            self.account_summary_currency = currency
+
+        log_info(
+            f"IBKR ACCOUNT SUMMARY | "
+            f"RequestID={reqId} | "
+            f"Tag={tag} | "
+            f"Value={value} | "
+            f"Currency={currency}"
+        )
+
+    def accountSummaryEnd(
+        self,
+        reqId
+    ):
+
+        if reqId != self.account_request_id:
+            return
+
+        self.account_summary_event.set()
+
+        log_info(
+            f"Fin consulta ACCOUNT SUMMARY | "
+            f"RequestID={reqId}"
+        )
+
+    def request_account_summary(
+        self
+    ):
+        """Solicita datos de cuenta a IBKR sin modificar nada."""
+
+        if not self.is_trading_connection_ready():
+
+            log_warning(
+                "No se puede solicitar ACCOUNT SUMMARY: "
+                "IBKR no está conectado."
+            )
+
+            return None
+
+        with self.order_lock:
+
+            self.account_request_id += 1
+            request_id = self.account_request_id
+
+            self.account_summary = {}
+            self.account_summary_currency = None
+            self.account_summary_event.clear()
+
+            tags = (
+                "NetLiquidation,"
+                "TotalCashValue,"
+                "AvailableFunds,"
+                "BuyingPower"
+            )
+
+            log_info(
+                f"Solicitando ACCOUNT SUMMARY | "
+                f"RequestID={request_id}"
+            )
+
+            try:
+
+                self.reqAccountSummary(
+                    request_id,
+                    "All",
+                    tags
+                )
+
+            except Exception as error:
+
+                log_error(
+                    f"Error solicitando ACCOUNT SUMMARY | "
+                    f"RequestID={request_id} | "
+                    f"{type(error).__name__}: {error}"
+                )
+
+                return None
+
+            return request_id
+
+    def get_account_summary(
+        self,
+        request_id,
+        timeout=10
+    ):
+        """Espera y devuelve el Account Summary de IBKR."""
+
+        if request_id != self.account_request_id:
+
+            log_error(
+                f"Request ID de ACCOUNT SUMMARY incorrecto | "
+                f"Expected={self.account_request_id} | "
+                f"Received={request_id}"
+            )
+
+            return {}
+
+        completed = self.account_summary_event.wait(
+            timeout=timeout
+        )
+
+        if not completed:
+
+            log_error(
+                f"TIMEOUT consultando ACCOUNT SUMMARY | "
+                f"RequestID={request_id}"
+            )
+
+            try:
+                self.cancelAccountSummary(request_id)
+            except Exception as error:
+                log_warning(
+                    f"Error cancelando ACCOUNT SUMMARY | "
+                    f"{type(error).__name__}: {error}"
+                )
+
+            return {}
+
+        try:
+            self.cancelAccountSummary(request_id)
+        except Exception as error:
+            log_warning(
+                f"Error cancelando ACCOUNT SUMMARY | "
+                f"{type(error).__name__}: {error}"
+            )
+
+        result = {}
+
+        for tag, data in self.account_summary.items():
+
+            value = data.get("value")
+
+            if value in (None, "", "N/A"):
+                result[tag] = None
+            else:
+                try:
+                    result[tag] = float(value)
+                except (TypeError, ValueError):
+                    result[tag] = value
+
+        if self.account_summary_currency:
+            result["Currency"] = self.account_summary_currency
+        else:
+            for data in self.account_summary.values():
+                currency = data.get("currency")
+                if currency:
+                    result["Currency"] = currency
+                    break
+
+        log_info(
+            f"ACCOUNT SUMMARY recibido | "
+            f"RequestID={request_id} | "
+            f"Datos={result}"
+        )
+
+        return result
 
     # ========================================================
     # ESPERAR POSICIÓN

@@ -1,7 +1,7 @@
 {
     "status": "STOPPING",
-    "started_at": "2026-08-25T10:05:03.223157+02:00",
-    "updated_at": "2026-08-25T10:05:30.584898+02:00",
+    "started_at": "2026-08-26T17:49:57.179043+02:00",
+    "updated_at": "2026-08-26T18:10:17.021146+02:00",
     "ibkr_connected": false,
     "gmail_connected": true,
     "current_message_id": null,
@@ -9,5 +9,5 @@
     "last_error": null,
     "last_order_id": null,
     "last_execution_price": null,
-    "position": 0.0
+    "position": 1.0
 }
