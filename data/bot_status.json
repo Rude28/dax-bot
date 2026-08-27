@@ -1,7 +1,7 @@
 {
     "status": "READY",
-    "started_at": "2026-08-26T20:52:43.009514+02:00",
-    "updated_at": "2026-08-26T21:00:52.136375+02:00",
+    "started_at": "2026-08-27T09:35:55.042985+02:00",
+    "updated_at": "2026-08-27T09:37:33.368976+02:00",
     "ibkr_connected": true,
     "gmail_connected": true,
     "current_message_id": null,
@@ -10,6 +10,6 @@
     "last_order_id": null,
     "last_execution_price": null,
     "position": 1.0,
-    "last_heartbeat": "2026-08-26T19:00:52.117016+00:00",
-    "last_cycle": "2026-08-26T19:00:52.117016+00:00"
+    "last_heartbeat": "2026-08-27T07:37:33.361946+00:00",
+    "last_cycle": "2026-08-27T07:37:33.361946+00:00"
 }
