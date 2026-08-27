@@ -1,13 +1,15 @@
 {
-    "status": "STOPPING",
-    "started_at": "2026-08-26T17:49:57.179043+02:00",
-    "updated_at": "2026-08-26T18:10:17.021146+02:00",
-    "ibkr_connected": false,
+    "status": "READY",
+    "started_at": "2026-08-26T20:52:43.009514+02:00",
+    "updated_at": "2026-08-26T21:00:52.136375+02:00",
+    "ibkr_connected": true,
     "gmail_connected": true,
     "current_message_id": null,
     "last_signal_status": null,
     "last_error": null,
     "last_order_id": null,
     "last_execution_price": null,
-    "position": 1.0
+    "position": 1.0,
+    "last_heartbeat": "2026-08-26T19:00:52.117016+00:00",
+    "last_cycle": "2026-08-26T19:00:52.117016+00:00"
 }

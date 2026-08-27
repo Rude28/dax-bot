@@ -2510,6 +2510,16 @@ def run():
         bot_state.set_position(ib_app.get_position())
         bot_state.set_status(READY)
 
+        # Primer heartbeat antes de entrar al ciclo.
+        try:
+            bot_state.heartbeat()
+            log_info("Heartbeat inicial creado.")
+        except Exception as error:
+            log_warning(
+                f"Error creando heartbeat inicial | "
+                f"{type(error).__name__}: {error}"
+            )
+
         log_info(
             "DAX BOT preparado y listo para recibir señales."
         )
@@ -2519,6 +2529,25 @@ def run():
         # ====================================================
 
         while True:
+
+            # ------------------------------------------------
+            # HEARTBEAT
+            # ------------------------------------------------
+            # Se actualiza al inicio de cada ciclo. Si el proceso
+            # queda bloqueado, el timestamp dejará de avanzar.
+            try:
+                bot_state.heartbeat()
+                log_info(
+                    "Heartbeat actualizado | "
+                    f"CycleStatus={bot_state.snapshot().get('status')}"
+                )
+            except Exception as error:
+                # Un fallo al escribir el heartbeat no debe crear
+                # una parada del bot ni afectar al trading.
+                log_warning(
+                    f"Error actualizando heartbeat | "
+                    f"{type(error).__name__}: {error}"
+                )
 
             try:
 

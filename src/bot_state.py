@@ -1,7 +1,8 @@
 import json
 import os
 import threading
-from datetime import datetime
+
+from datetime import datetime, timezone
 
 
 # ============================================================
@@ -29,6 +30,16 @@ STOPPING = "STOPPING"
 STATUS_FILE = os.path.join(
     "data",
     "bot_status.json"
+)
+
+
+# ============================================================
+# ARCHIVO HEARTBEAT
+# ============================================================
+
+HEARTBEAT_FILE = os.path.join(
+    "data",
+    "bot_heartbeat.json"
 )
 
 
@@ -86,6 +97,13 @@ class BotState:
         self.position = 0.0
 
         # ----------------------------------------------------
+        # HEARTBEAT
+        # ----------------------------------------------------
+
+        self.last_heartbeat = None
+        self.last_cycle = None
+
+        # ----------------------------------------------------
         # CREAR ESTADO INICIAL
         # ----------------------------------------------------
 
@@ -95,7 +113,9 @@ class BotState:
     # DIRECTORIO
     # ========================================================
 
-    def _ensure_directory(self):
+    def _ensure_directory(
+        self
+    ):
 
         directory = os.path.dirname(
             STATUS_FILE
@@ -109,10 +129,31 @@ class BotState:
             )
 
     # ========================================================
+    # DIRECTORIO HEARTBEAT
+    # ========================================================
+
+    def _ensure_heartbeat_directory(
+        self
+    ):
+
+        directory = os.path.dirname(
+            HEARTBEAT_FILE
+        )
+
+        if directory:
+
+            os.makedirs(
+                directory,
+                exist_ok=True
+            )
+
+    # ========================================================
     # SNAPSHOT INTERNO
     # ========================================================
 
-    def _snapshot_locked(self):
+    def _snapshot_locked(
+        self
+    ):
 
         return {
 
@@ -147,14 +188,22 @@ class BotState:
                 self.last_execution_price,
 
             "position":
-                self.position
+                self.position,
+
+            "last_heartbeat":
+                self.last_heartbeat,
+
+            "last_cycle":
+                self.last_cycle,
         }
 
     # ========================================================
     # GUARDAR ESTADO
     # ========================================================
 
-    def _save(self):
+    def _save(
+        self
+    ):
 
         with self._lock:
 
@@ -208,6 +257,103 @@ class BotState:
                 )
 
     # ========================================================
+    # HEARTBEAT
+    # ========================================================
+
+    def heartbeat(
+        self
+    ):
+        """
+        Registra un pulso del proceso principal.
+
+        El heartbeat NO ejecuta órdenes ni modifica
+        ninguna lógica de trading.
+
+        Actualiza:
+            - last_heartbeat
+            - last_cycle
+
+        y persiste el resultado en:
+            data/bot_heartbeat.json
+        """
+
+        now = (
+            datetime.now(
+                timezone.utc
+            ).isoformat()
+        )
+
+        with self._lock:
+
+            self.last_heartbeat = now
+            self.last_cycle = now
+
+        # ----------------------------------------------------
+        # Guardar también en bot_status.json para que el estado
+        # principal tenga constancia del último heartbeat.
+        # ----------------------------------------------------
+
+        self._save()
+
+        # ----------------------------------------------------
+        # Guardar heartbeat independiente.
+        # ----------------------------------------------------
+
+        heartbeat_data = {
+
+            "status":
+                "RUNNING",
+
+            "last_heartbeat":
+                now,
+
+            "last_cycle":
+                now,
+        }
+
+        try:
+
+            self._ensure_heartbeat_directory()
+
+            temporary_file = (
+                HEARTBEAT_FILE
+                + ".tmp"
+            )
+
+            with open(
+                temporary_file,
+                "w",
+                encoding="utf-8"
+            ) as file:
+
+                json.dump(
+                    heartbeat_data,
+                    file,
+                    ensure_ascii=False,
+                    indent=4
+                )
+
+                file.flush()
+
+                os.fsync(
+                    file.fileno()
+                )
+
+            os.replace(
+                temporary_file,
+                HEARTBEAT_FILE
+            )
+
+        except Exception as error:
+
+            print(
+                "ERROR guardando "
+                f"{HEARTBEAT_FILE}: "
+                f"{type(error).__name__}: "
+                f"{error}"
+            )
+
+    # ========================================================
     # CAMBIAR ESTADO
     # ========================================================
 
@@ -241,7 +387,9 @@ class BotState:
     # MARCAR INICIO
     # ========================================================
 
-    def mark_started(self):
+    def mark_started(
+        self
+    ):
 
         with self._lock:
 
@@ -257,6 +405,9 @@ class BotState:
             self.status = STARTING
 
             self.last_error = None
+
+            self.last_heartbeat = None
+            self.last_cycle = None
 
         self._save()
 
@@ -329,7 +480,9 @@ class BotState:
 
         self._save()
 
-    def clear_current_signal(self):
+    def clear_current_signal(
+        self
+    ):
 
         with self._lock:
 
@@ -444,7 +597,9 @@ class BotState:
     # LIMPIAR ERROR
     # ========================================================
 
-    def clear_error(self):
+    def clear_error(
+        self
+    ):
 
         with self._lock:
 
@@ -462,7 +617,9 @@ class BotState:
     # SNAPSHOT PÚBLICO
     # ========================================================
 
-    def snapshot(self):
+    def snapshot(
+        self
+    ):
 
         with self._lock:
 
@@ -510,6 +667,50 @@ def load_saved_status():
         raise RuntimeError(
             "No se pudo leer "
             "bot_status.json: "
+            f"{type(error).__name__}: "
+            f"{error}"
+        ) from error
+
+
+# ============================================================
+# LEER HEARTBEAT PERSISTENTE
+# ============================================================
+
+def load_saved_heartbeat():
+
+    try:
+
+        with open(
+            HEARTBEAT_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            data = json.load(
+                file
+            )
+
+        if not isinstance(
+            data,
+            dict
+        ):
+
+            raise ValueError(
+                "bot_heartbeat.json "
+                "no contiene un objeto JSON."
+            )
+
+        return data
+
+    except FileNotFoundError:
+
+        return None
+
+    except Exception as error:
+
+        raise RuntimeError(
+            "No se pudo leer "
+            "bot_heartbeat.json: "
             f"{type(error).__name__}: "
             f"{error}"
         ) from error
