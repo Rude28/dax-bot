@@ -27,3 +27,5 @@ Thumbs.db
 # Estado local del bot
 data/processed_signals.json
 data/processed_signals.json.tmp
+data/bot_status.json
+data/bot_heartbeat.json
