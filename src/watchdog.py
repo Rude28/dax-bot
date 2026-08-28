@@ -1,15 +1,22 @@
 import json
 import os
+import smtplib
 import subprocess
 import sys
 import time
 
 from datetime import datetime, timezone
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+from dotenv import load_dotenv
 
 
 # ============================================================
 # CONFIGURACIÓN
 # ============================================================
+
+load_dotenv()
 
 HEARTBEAT_FILE = os.path.join(
     "data",
@@ -28,53 +35,188 @@ BOT_SCRIPT = os.path.join(
 
 BOT_SCRIPT_NAME = "bot_auto.py"
 
-# ------------------------------------------------------------
-# HEARTBEAT
-# ------------------------------------------------------------
+HEARTBEAT_TIMEOUT = float(
+    os.getenv(
+        "HEARTBEAT_TIMEOUT",
+        "30"
+    )
+)
 
-HEARTBEAT_TIMEOUT = 30.0
+WATCHDOG_INTERVAL = float(
+    os.getenv(
+        "WATCHDOG_INTERVAL",
+        "5"
+    )
+)
 
-# ------------------------------------------------------------
-# WATCHDOG
-# ------------------------------------------------------------
+REQUIRED_TIMEOUTS = int(
+    os.getenv(
+        "WATCHDOG_REQUIRED_TIMEOUTS",
+        "2"
+    )
+)
 
-WATCHDOG_INTERVAL = 5.0
+RECOVERY_TIMEOUT = float(
+    os.getenv(
+        "WATCHDOG_RECOVERY_TIMEOUT",
+        "90"
+    )
+)
 
-# Número de timeouts consecutivos para confirmar caída.
-REQUIRED_TIMEOUTS = 2
+RECOVERY_CHECK_INTERVAL = float(
+    os.getenv(
+        "WATCHDOG_RECOVERY_CHECK_INTERVAL",
+        "5"
+    )
+)
 
-# ------------------------------------------------------------
-# RECUPERACIÓN
-# ------------------------------------------------------------
+RESTART_COOLDOWN = float(
+    os.getenv(
+        "WATCHDOG_RESTART_COOLDOWN",
+        "60"
+    )
+)
 
-RECOVERY_TIMEOUT = 90.0
-RECOVERY_CHECK_INTERVAL = 5.0
+WATCHDOG_AUTO_RECOVER = (
+    os.getenv(
+        "WATCHDOG_AUTO_RECOVER",
+        "true"
+    )
+    .strip()
+    .lower()
+    in (
+        "1",
+        "true",
+        "yes",
+        "on"
+    )
+)
 
-# Tiempo mínimo entre intentos de recuperación.
-RESTART_COOLDOWN = 30.0
+GMAIL_USER = os.getenv(
+    "GMAIL_USER"
+)
+
+GMAIL_APP_PASSWORD = os.getenv(
+    "GMAIL_APP_PASSWORD"
+)
+
+SMTP_SERVER = os.getenv(
+    "SMTP_SERVER",
+    "smtp.gmail.com"
+)
+
+SMTP_PORT = int(
+    os.getenv(
+        "SMTP_PORT",
+        "465"
+    )
+)
+
+NOTIFY_EMAIL = os.getenv(
+    "NOTIFY_EMAIL",
+    GMAIL_USER
+)
 
 
 # ============================================================
-# UTILIDADES DE TIEMPO
+# FECHA
 # ============================================================
 
-def parse_timestamp(timestamp):
-    if not timestamp:
-        raise RuntimeError(
-            "El heartbeat no contiene last_heartbeat."
+def utc_now_text():
+    return (
+        datetime.now(
+            timezone.utc
+        ).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
         )
+    )
+
+
+# ============================================================
+# EMAIL DE ALERTA
+# ============================================================
+
+def send_watchdog_email(
+    subject,
+    body
+):
+    if not GMAIL_USER:
+        print(
+            "WATCHDOG EMAIL ERROR: falta GMAIL_USER."
+        )
+        return False
+
+    if not GMAIL_APP_PASSWORD:
+        print(
+            "WATCHDOG EMAIL ERROR: "
+            "falta GMAIL_APP_PASSWORD."
+        )
+        return False
+
+    if not NOTIFY_EMAIL:
+        print(
+            "WATCHDOG EMAIL ERROR: falta NOTIFY_EMAIL."
+        )
+        return False
+
+    message = MIMEMultipart()
+
+    message["From"] = GMAIL_USER
+    message["To"] = NOTIFY_EMAIL
+    message["Subject"] = subject
+
+    message.attach(
+        MIMEText(
+            body,
+            "plain",
+            "utf-8"
+        )
+    )
+
+    smtp = None
 
     try:
-        parsed = datetime.fromisoformat(str(timestamp))
-    except ValueError as error:
-        raise RuntimeError(
-            f"Timestamp heartbeat inválido: {timestamp}"
-        ) from error
+        print(
+            f"WATCHDOG | Enviando alerta | "
+            f"Subject={subject}"
+        )
 
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        smtp = smtplib.SMTP_SSL(
+            SMTP_SERVER,
+            SMTP_PORT,
+            timeout=15
+        )
 
-    return parsed.astimezone(timezone.utc)
+        smtp.login(
+            GMAIL_USER,
+            GMAIL_APP_PASSWORD
+        )
+
+        smtp.sendmail(
+            GMAIL_USER,
+            [NOTIFY_EMAIL],
+            message.as_string()
+        )
+
+        print(
+            "WATCHDOG | Alerta enviada correctamente."
+        )
+
+        return True
+
+    except Exception as error:
+        print(
+            "WATCHDOG EMAIL ERROR | "
+            f"{type(error).__name__}: {error}"
+        )
+        return False
+
+    finally:
+        if smtp is not None:
+            try:
+                smtp.quit()
+            except Exception:
+                pass
 
 
 # ============================================================
@@ -92,7 +234,8 @@ def load_heartbeat():
 
     except FileNotFoundError as error:
         raise RuntimeError(
-            f"No existe el archivo heartbeat: {HEARTBEAT_FILE}"
+            f"No existe el archivo heartbeat: "
+            f"{HEARTBEAT_FILE}"
         ) from error
 
     except json.JSONDecodeError as error:
@@ -115,7 +258,7 @@ def load_heartbeat():
 
 
 # ============================================================
-# LEER ESTADO DEL BOT
+# LEER ESTADO BOT
 # ============================================================
 
 def load_bot_status():
@@ -129,7 +272,8 @@ def load_bot_status():
 
     except FileNotFoundError as error:
         raise RuntimeError(
-            f"No existe el archivo de estado: {STATUS_FILE}"
+            f"No existe el archivo de estado: "
+            f"{STATUS_FILE}"
         ) from error
 
     except json.JSONDecodeError as error:
@@ -145,30 +289,72 @@ def load_bot_status():
 
     if not isinstance(data, dict):
         raise RuntimeError(
-            "bot_status.json no contiene un objeto JSON válido."
+            "bot_status.json no contiene "
+            "un objeto JSON válido."
         )
 
     return data
 
 
 # ============================================================
+# PARSEAR TIMESTAMP
+# ============================================================
+
+def parse_timestamp(
+    timestamp
+):
+    if not timestamp:
+        raise RuntimeError(
+            "El heartbeat no contiene last_heartbeat."
+        )
+
+    try:
+        parsed = datetime.fromisoformat(
+            str(timestamp)
+        )
+
+    except ValueError as error:
+        raise RuntimeError(
+            f"Timestamp heartbeat inválido: {timestamp}"
+        ) from error
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(
+            tzinfo=timezone.utc
+        )
+
+    return parsed.astimezone(
+        timezone.utc
+    )
+
+
+# ============================================================
 # COMPROBAR HEARTBEAT
 # ============================================================
 
-def check_heartbeat(timeout=HEARTBEAT_TIMEOUT):
+def check_heartbeat(
+    timeout=HEARTBEAT_TIMEOUT
+):
     data = load_heartbeat()
 
     last_heartbeat = parse_timestamp(
-        data.get("last_heartbeat")
+        data.get(
+            "last_heartbeat"
+        )
     )
 
-    last_cycle = data.get("last_cycle")
+    last_cycle = data.get(
+        "last_cycle"
+    )
+
     heartbeat_status = data.get(
         "status",
         "UNKNOWN"
     )
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(
+        timezone.utc
+    )
 
     age = (
         now - last_heartbeat
@@ -190,20 +376,10 @@ def check_heartbeat(timeout=HEARTBEAT_TIMEOUT):
 
 
 # ============================================================
-# COMPROBAR READY REAL
+# COMPROBAR READY
 # ============================================================
 
 def check_bot_ready():
-    """
-    La recuperación no se considera completa solo porque
-    aparezca un heartbeat nuevo.
-
-    Exigimos además:
-      - status == READY
-      - IBKR conectado
-      - Gmail conectado
-    """
-
     try:
         data = load_bot_status()
 
@@ -252,16 +428,10 @@ def check_bot_ready():
 
 
 # ============================================================
-# COMPROBAR PROCESO ESPECÍFICO BOT_AUTO.PY
+# PROCESOS PYTHON
 # ============================================================
 
 def _query_python_processes():
-    """
-    Obtiene las líneas de comando de procesos python.exe.
-
-    Primero intenta WMIC y, si no está disponible, PowerShell.
-    """
-
     try:
         result = subprocess.run(
             [
@@ -271,12 +441,12 @@ def _query_python_processes():
                 "name='python.exe'",
                 "get",
                 "ProcessId,CommandLine",
-                "/format:list",
+                "/format:list"
             ],
             capture_output=True,
             text=True,
             timeout=5,
-            check=False,
+            check=False
         )
 
         return result.stdout or ""
@@ -285,7 +455,7 @@ def _query_python_processes():
         pass
 
     except Exception:
-        return ""
+        pass
 
     try:
         result = subprocess.run(
@@ -298,12 +468,12 @@ def _query_python_processes():
                     "-Filter \"Name = 'python.exe'\" "
                     "| Select-Object ProcessId,CommandLine "
                     "| Format-List"
-                ),
+                )
             ],
             capture_output=True,
             text=True,
             timeout=5,
-            check=False,
+            check=False
         )
 
         return result.stdout or ""
@@ -321,22 +491,18 @@ def is_bot_process_running():
     )
 
 
-# ============================================================
-# INFORMACIÓN DEL PROCESO BOT
-# ============================================================
-
 def get_bot_process_info():
     output = _query_python_processes()
 
-    matching_lines = []
+    matching = []
 
     for line in output.splitlines():
         if BOT_SCRIPT_NAME.lower() in line.lower():
-            matching_lines.append(line)
+            matching.append(line)
 
     return {
-        "running": bool(matching_lines),
-        "info": "\n".join(matching_lines) or None,
+        "running": bool(matching),
+        "info": "\n".join(matching) if matching else None
     }
 
 
@@ -396,10 +562,12 @@ def start_bot():
     process = subprocess.Popen(
         [
             python_executable,
-            script_path,
+            script_path
         ],
         cwd=project_dir,
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        creationflags=(
+            subprocess.CREATE_NEW_PROCESS_GROUP
+        )
     )
 
     print(
@@ -417,16 +585,6 @@ def wait_for_recovery(
     old_heartbeat,
     timeout=RECOVERY_TIMEOUT
 ):
-    """
-    La recuperación solo se confirma cuando:
-
-      1. El heartbeat cambia.
-      2. El heartbeat está reciente.
-      3. bot_status.json indica READY.
-      4. IBKR está conectado.
-      5. Gmail está conectado.
-    """
-
     start_time = time.time()
 
     while (
@@ -446,7 +604,8 @@ def wait_for_recovery(
             )
 
             heartbeat_changed = (
-                current_heartbeat != old_heartbeat
+                current_heartbeat
+                != old_heartbeat
             )
 
             heartbeat_ok = (
@@ -455,16 +614,20 @@ def wait_for_recovery(
             )
 
         except Exception:
-            heartbeat_result = None
+            pass
 
         ready_result = check_bot_ready()
 
         print(
             "RECOVERY CHECK | "
-            f"Heartbeat={'OK' if heartbeat_ok else 'NO'} | "
-            f"READY={'YES' if ready_result['ready'] else 'NO'} | "
-            f"IBKR={'OK' if ready_result['ibkr_connected'] else 'NO'} | "
-            f"Gmail={'OK' if ready_result['gmail_connected'] else 'NO'}"
+            f"Heartbeat="
+            f"{'OK' if heartbeat_ok else 'NO'} | "
+            f"READY="
+            f"{'YES' if ready_result['ready'] else 'NO'} | "
+            f"IBKR="
+            f"{'OK' if ready_result['ibkr_connected'] else 'NO'} | "
+            f"Gmail="
+            f"{'OK' if ready_result['gmail_connected'] else 'NO'}"
         )
 
         if (
@@ -484,6 +647,101 @@ def wait_for_recovery(
 
 
 # ============================================================
+# ALERTA CAÍDA
+# ============================================================
+
+def send_failure_alert(
+    heartbeat_result,
+    ready_result
+):
+    body = (
+        "DAX BOT - ALERTA CRÍTICA\n"
+        "========================\n\n"
+
+        "El watchdog ha confirmado que "
+        "bot_auto.py no responde.\n\n"
+
+        f"Hora de detección: "
+        f"{utc_now_text()}\n\n"
+
+        f"Último heartbeat: "
+        f"{heartbeat_result.get('last_heartbeat')}\n"
+
+        f"Edad del heartbeat: "
+        f"{heartbeat_result.get('age_seconds'):.2f} segundos\n"
+
+        f"Estado registrado: "
+        f"{ready_result.get('status')}\n"
+
+        f"IBKR: "
+        f"{'CONECTADO' if ready_result.get('ibkr_connected') else 'DESCONECTADO'}\n"
+
+        f"Gmail: "
+        f"{'CONECTADO' if ready_result.get('gmail_connected') else 'DESCONECTADO'}\n\n"
+
+        f"Recuperación automática: "
+        f"{'ACTIVADA' if WATCHDOG_AUTO_RECOVER else 'DESACTIVADA'}\n\n"
+
+        "INTERVENCIÓN MANUAL NECESARIA "
+        "si el bot no puede recuperarse."
+    )
+
+    return send_watchdog_email(
+        "DAX BOT - ALERTA: BOT NO RESPONDE",
+        body
+    )
+
+
+# ============================================================
+# ALERTA RECUPERACIÓN
+# ============================================================
+
+def send_recovery_alert(
+    recovered
+):
+    heartbeat_result = (
+        recovered["heartbeat"]
+    )
+
+    ready_result = (
+        recovered["ready"]
+    )
+
+    body = (
+        "DAX BOT - BOT RECUPERADO\n"
+        "========================\n\n"
+
+        "El watchdog ha confirmado la "
+        "recuperación completa del bot.\n\n"
+
+        f"Hora de recuperación: "
+        f"{utc_now_text()}\n\n"
+
+        f"Heartbeat: "
+        f"{heartbeat_result.get('last_heartbeat')}\n"
+
+        f"Edad heartbeat: "
+        f"{heartbeat_result.get('age_seconds'):.2f} segundos\n"
+
+        f"Estado: "
+        f"{ready_result.get('status')}\n"
+
+        f"IBKR: "
+        f"{'CONECTADO' if ready_result.get('ibkr_connected') else 'DESCONECTADO'}\n"
+
+        f"Gmail: "
+        f"{'CONECTADO' if ready_result.get('gmail_connected') else 'DESCONECTADO'}\n\n"
+
+        "El bot vuelve a estar READY."
+    )
+
+    return send_watchdog_email(
+        "DAX BOT - BOT RECUPERADO",
+        body
+    )
+
+
+# ============================================================
 # RECUPERACIÓN
 # ============================================================
 
@@ -499,15 +757,12 @@ def recover_bot():
         "########################################"
     )
 
-    # --------------------------------------------------------
-    # Heartbeat anterior
-    # --------------------------------------------------------
-
     try:
         old_data = load_heartbeat()
         old_heartbeat = old_data.get(
             "last_heartbeat"
         )
+
     except Exception as error:
         print(
             "No se pudo leer heartbeat anterior:"
@@ -516,10 +771,6 @@ def recover_bot():
             f"{type(error).__name__}: {error}"
         )
         old_heartbeat = None
-
-    # --------------------------------------------------------
-    # El bot debe estar realmente ausente.
-    # --------------------------------------------------------
 
     bot_running = (
         is_bot_process_running()
@@ -545,18 +796,14 @@ def recover_bot():
 
         print()
         print(
-            "No se iniciará una segunda instancia "
-            "automáticamente."
+            "No se iniciará una segunda instancia."
         )
+
         print(
             "Recuperación cancelada por seguridad."
         )
 
-        return False
-
-    # --------------------------------------------------------
-    # Arrancar
-    # --------------------------------------------------------
+        return None
 
     try:
         process = start_bot()
@@ -569,11 +816,7 @@ def recover_bot():
         print(
             f"{type(error).__name__}: {error}"
         )
-        return False
-
-    # --------------------------------------------------------
-    # Esperar heartbeat + READY
-    # --------------------------------------------------------
+        return None
 
     print()
     print(
@@ -598,15 +841,7 @@ def recover_bot():
         print(
             f"PID iniciado: {process.pid}"
         )
-        print(
-            "No se alcanzó READY con "
-            "IBKR y Gmail conectados dentro "
-            "del tiempo esperado."
-        )
-        return False
-
-    heartbeat_result = recovered["heartbeat"]
-    ready_result = recovered["ready"]
+        return None
 
     print()
     print(
@@ -618,46 +853,34 @@ def recover_bot():
     print(
         "========================================"
     )
+
+    ready_result = recovered["ready"]
+
     print(
-        f"Heartbeat nuevo: "
-        f"{heartbeat_result['last_heartbeat']}"
+        f"Estado: {ready_result['status']}"
     )
-    print(
-        f"Edad heartbeat: "
-        f"{heartbeat_result['age_seconds']:.2f} s"
-    )
-    print(
-        f"Estado bot: "
-        f"{ready_result['status']}"
-    )
+
     print(
         f"IBKR: "
         f"{'CONECTADO' if ready_result['ibkr_connected'] else 'DESCONECTADO'}"
     )
+
     print(
         f"Gmail: "
         f"{'CONECTADO' if ready_result['gmail_connected'] else 'DESCONECTADO'}"
     )
 
-    return True
+    return recovered
 
 
 # ============================================================
-# MOSTRAR ESTADO
+# ESTADO WATCHDOG
 # ============================================================
 
 def print_status(
     result,
     consecutive_timeouts
 ):
-    current_time = (
-        datetime.now(
-            timezone.utc
-        ).strftime(
-            "%Y-%m-%d %H:%M:%S UTC"
-        )
-    )
-
     ready_result = check_bot_ready()
 
     print()
@@ -672,7 +895,7 @@ def print_status(
     )
 
     print(
-        f"Hora: {current_time}"
+        f"Hora: {utc_now_text()}"
     )
 
     print(
@@ -733,14 +956,12 @@ def print_status(
         >= REQUIRED_TIMEOUTS
     ):
         print(
-            "RESULTADO: BOT NO RESPONDE "
-            "CONFIRMADO"
+            "RESULTADO: BOT NO RESPONDE CONFIRMADO"
         )
 
     else:
         print(
-            "RESULTADO: TIMEOUT "
-            "NO CONFIRMADO"
+            "RESULTADO: TIMEOUT NO CONFIRMADO"
         )
 
     print(
@@ -749,7 +970,7 @@ def print_status(
 
 
 # ============================================================
-# WATCHDOG
+# WATCHDOG PRINCIPAL
 # ============================================================
 
 def watchdog_loop():
@@ -763,56 +984,98 @@ def watchdog_loop():
     print(
         "========================================"
     )
+
     print(
         f"Heartbeat: {HEARTBEAT_FILE}"
     )
-    print(
-        f"Estado: {STATUS_FILE}"
-    )
+
     print(
         f"Bot script: {BOT_SCRIPT}"
     )
+
     print(
-        f"Timeout: {HEARTBEAT_TIMEOUT} segundos"
+        f"Heartbeat timeout: "
+        f"{HEARTBEAT_TIMEOUT} s"
     )
+
     print(
-        f"Comprobación cada "
-        f"{WATCHDOG_INTERVAL} segundos"
+        f"Comprobación: "
+        f"{WATCHDOG_INTERVAL} s"
     )
+
     print(
         f"Timeouts necesarios: "
         f"{REQUIRED_TIMEOUTS}"
     )
+
     print(
-        f"Recovery timeout: "
-        f"{RECOVERY_TIMEOUT} segundos"
+        f"Auto recovery: "
+        f"{'ON' if WATCHDOG_AUTO_RECOVER else 'OFF'}"
     )
+
     print()
+
     print(
         "Watchdog iniciado."
     )
 
     consecutive_timeouts = 0
-    last_restart = 0.0
+    last_recovery_attempt = 0.0
+
+    incident_active = False
+    failure_alert_sent = False
 
     while True:
+
         try:
+
             result = check_heartbeat()
 
             if result["alive"]:
+
                 consecutive_timeouts = 0
+
                 print_status(
                     result,
                     consecutive_timeouts
                 )
 
+                if incident_active:
+
+                    ready_result = (
+                        check_bot_ready()
+                    )
+
+                    if ready_result["ready"]:
+
+                        recovery_data = {
+                            "heartbeat":
+                                result,
+                            "ready":
+                                ready_result
+                        }
+
+                        if send_recovery_alert(
+                            recovery_data
+                        ):
+
+                            print(
+                                "WATCHDOG | "
+                                "Correo de recuperación enviado."
+                            )
+
+                        incident_active = False
+                        failure_alert_sent = False
+
             else:
+
                 consecutive_timeouts += 1
 
                 if (
                     consecutive_timeouts
                     > REQUIRED_TIMEOUTS
                 ):
+
                     consecutive_timeouts = (
                         REQUIRED_TIMEOUTS
                     )
@@ -826,46 +1089,93 @@ def watchdog_loop():
                     consecutive_timeouts
                     >= REQUIRED_TIMEOUTS
                 ):
-                    now = time.time()
 
-                    cooldown_finished = (
-                        now - last_restart
-                        >= RESTART_COOLDOWN
+                    ready_result = (
+                        check_bot_ready()
                     )
 
-                    if cooldown_finished:
-                        print()
-                        print(
-                            "BOT NO RESPONDE CONFIRMADO."
+                    incident_active = True
+
+                    if not failure_alert_sent:
+
+                        if send_failure_alert(
+                            result,
+                            ready_result
+                        ):
+
+                            failure_alert_sent = True
+
+                    if WATCHDOG_AUTO_RECOVER:
+
+                        now = time.time()
+
+                        cooldown_finished = (
+                            now
+                            - last_recovery_attempt
+                            >= RESTART_COOLDOWN
                         )
-                        print(
-                            "Iniciando recuperación..."
-                        )
 
-                        success = recover_bot()
+                        if cooldown_finished:
 
-                        last_restart = now
-
-                        if success:
                             print()
                             print(
-                                "Recuperación completada."
-                            )
-                        else:
-                            print()
-                            print(
-                                "Recuperación no confirmada."
+                                "BOT NO RESPONDE CONFIRMADO."
                             )
 
-                        consecutive_timeouts = 0
+                            print(
+                                "Iniciando recuperación..."
+                            )
+
+                            last_recovery_attempt = now
+
+                            recovered = (
+                                recover_bot()
+                            )
+
+                            if recovered is not None:
+
+                                print()
+                                print(
+                                    "Recuperación completada."
+                                )
+
+                                # Evitamos que se envíe
+                                # dos veces la alerta de
+                                # recuperación.
+                                send_recovery_alert(
+                                    recovered
+                                )
+
+                                incident_active = False
+                                failure_alert_sent = False
+                                consecutive_timeouts = 0
+
+                            else:
+
+                                print()
+                                print(
+                                    "Recuperación no confirmada."
+                                )
+
+                                consecutive_timeouts = 0
 
                     else:
+
                         print()
                         print(
-                            "Recovery cooldown activo."
+                            "AUTO RECOVERY DESACTIVADA."
+                        )
+
+                        print(
+                            "Intervención manual necesaria."
+                        )
+
+                        consecutive_timeouts = (
+                            REQUIRED_TIMEOUTS
                         )
 
         except Exception as error:
+
             print()
             print(
                 "========================================"
@@ -894,10 +1204,12 @@ def watchdog_loop():
 # ============================================================
 
 if __name__ == "__main__":
+
     try:
         watchdog_loop()
 
     except KeyboardInterrupt:
+
         print()
         print(
             "Watchdog detenido manualmente."
