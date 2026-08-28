@@ -1,11 +1,11 @@
-from paper_executor import (
-    open_long,
-    open_short,
-    close_position,
-)
-
 from signal_state import (
     SignalState,
+)
+
+from logger import (
+    log_info,
+    log_warning,
+    log_error,
 )
 
 
@@ -24,6 +24,16 @@ CLOSE_SHORT = "CERRAR_CORTO"
 # ============================================================
 
 class SignalExecutor:
+    """
+    Motor de señales compartido por PAPER y LIVE.
+
+    La diferencia entre entornos está en ib_app:
+        PaperExecutor
+        LiveExecutor
+
+    El motor mantiene la misma lógica de estado, PROCESSING,
+    operaciones secuenciales y validación de posición.
+    """
 
     def __init__(
         self,
@@ -35,6 +45,28 @@ class SignalExecutor:
         self.state_manager = (
             state_manager
         )
+
+    # ========================================================
+    # CAPACIDAD DEL EXECUTOR
+    # ========================================================
+
+    def _executor_ready(self):
+
+        if self.ib_app is None:
+            return False
+
+        if hasattr(
+            self.ib_app,
+            "is_trading_connection_ready"
+        ):
+            try:
+                return bool(
+                    self.ib_app.is_trading_connection_ready()
+                )
+            except Exception:
+                return False
+
+        return True
 
     # ========================================================
     # EJECUTAR
@@ -97,6 +129,17 @@ class SignalExecutor:
         print(
             "========================================"
         )
+
+        # ----------------------------------------------------
+        # Verificar que el executor está preparado.
+        # ----------------------------------------------------
+
+        if not self._executor_ready():
+
+            return self._error_result(
+                signal,
+                "El executor IBKR no está preparado."
+            )
 
         # ----------------------------------------------------
         # Calcular posición inicial y final esperada.
@@ -293,7 +336,7 @@ class SignalExecutor:
             )
 
         # ----------------------------------------------------
-        # El PaperExecutor utilizará este Order ID.
+        # El executor LIVE/PAPER utilizará este Order ID.
         # ----------------------------------------------------
 
         order_id = (
@@ -391,7 +434,7 @@ class SignalExecutor:
 
                 return result
 
-            runner = open_long
+            runner = self.ib_app.open_long
 
         elif action == CLOSE_LONG:
 
@@ -406,7 +449,7 @@ class SignalExecutor:
                     current_position
                 )
 
-            runner = close_position
+            runner = self.ib_app.close_position
 
         elif action == OPEN_SHORT:
 
@@ -423,7 +466,7 @@ class SignalExecutor:
                     current_position
                 )
 
-            runner = open_short
+            runner = self.ib_app.open_short
 
         elif action == CLOSE_SHORT:
 
@@ -438,7 +481,7 @@ class SignalExecutor:
                     current_position
                 )
 
-            runner = close_position
+            runner = self.ib_app.close_position
 
         else:
 
@@ -470,9 +513,7 @@ class SignalExecutor:
         # Ejecutar.
         # ----------------------------------------------------
 
-        result = runner(
-            self.ib_app
-        )
+        result = runner()
 
         return self._save_operation_result(
             signal,
@@ -527,9 +568,7 @@ class SignalExecutor:
                 str(error)
             )
 
-        close_result = close_position(
-            self.ib_app
-        )
+        close_result = self.ib_app.close_position()
 
         close_result = (
             self._save_operation_result(
@@ -587,9 +626,7 @@ class SignalExecutor:
                 str(error)
             )
 
-        open_result = open_short(
-            self.ib_app
-        )
+        open_result = self.ib_app.open_short()
 
         open_result = (
             self._save_operation_result(
@@ -688,9 +725,7 @@ class SignalExecutor:
                 str(error)
             )
 
-        close_result = close_position(
-            self.ib_app
-        )
+        close_result = self.ib_app.close_position()
 
         close_result = (
             self._save_operation_result(
@@ -748,9 +783,7 @@ class SignalExecutor:
                 str(error)
             )
 
-        open_result = open_long(
-            self.ib_app
-        )
+        open_result = self.ib_app.open_long()
 
         open_result = (
             self._save_operation_result(

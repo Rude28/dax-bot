@@ -8,7 +8,6 @@ from logger import (
 
 from bot_state import (
     bot_state,
-    READY,
 )
 
 
@@ -18,24 +17,39 @@ from bot_state import (
 
 TRADING_MODE = os.getenv(
     "TRADING_MODE",
-    "PAPER"
+    "LIVE"
 )
 
 
 # ============================================================
-# COMANDOS MANUALES
+# COMANDOS
 # ============================================================
 
-MANUAL_COMMANDS = {
-    "OPEN LONG",
-    "CLOSE LONG",
-    "OPEN SHORT",
-    "CLOSE SHORT",
+STATUS = "STATUS"
+POSITIONS = "POSITIONS"
+ACCOUNT = "ACCOUNT"
+
+OPEN_LONG = "OPEN LONG"
+CLOSE_LONG = "CLOSE LONG"
+OPEN_SHORT = "OPEN SHORT"
+CLOSE_SHORT = "CLOSE SHORT"
+
+SUPPORTED_QUERY_COMMANDS = {
+    STATUS,
+    POSITIONS,
+    ACCOUNT,
+}
+
+SUPPORTED_MANUAL_COMMANDS = {
+    OPEN_LONG,
+    CLOSE_LONG,
+    OPEN_SHORT,
+    CLOSE_SHORT,
 }
 
 
 # ============================================================
-# FORMATEAR NÚMEROS
+# UTILIDADES
 # ============================================================
 
 def format_number(
@@ -60,10 +74,6 @@ def format_number(
         return str(value)
 
 
-# ============================================================
-# DIRECCIÓN DE POSICIÓN
-# ============================================================
-
 def get_position_direction(
     position
 ):
@@ -82,11 +92,9 @@ def get_position_direction(
         return "DESCONOCIDA"
 
     if position > 0:
-
         return "LARGO"
 
     if position < 0:
-
         return "CORTO"
 
     return "SIN POSICIÓN"
@@ -104,6 +112,47 @@ class ControlExecutor:
     ):
 
         self.ib_app = ib_app
+
+    # ========================================================
+    # DISPONIBILIDAD IBKR
+    # ========================================================
+
+    def _ibkr_ready(self):
+
+        if self.ib_app is None:
+            return False
+
+        if hasattr(
+            self.ib_app,
+            "is_trading_connection_ready"
+        ):
+
+            try:
+
+                return bool(
+                    self.ib_app.is_trading_connection_ready()
+                )
+
+            except Exception:
+
+                return False
+
+        if hasattr(
+            self.ib_app,
+            "isConnected"
+        ):
+
+            try:
+
+                return bool(
+                    self.ib_app.isConnected()
+                )
+
+            except Exception:
+
+                return False
+
+        return True
 
     # ========================================================
     # STATUS
@@ -130,19 +179,21 @@ class ControlExecutor:
             )
         )
 
-        status = state.get(
-            "status",
-            "UNKNOWN"
+        status = (
+            state.get(
+                "status",
+                "UNKNOWN"
+            )
         )
 
-        ibkr_connected = (
+        ibkr_connected = bool(
             state.get(
                 "ibkr_connected",
                 False
             )
         )
 
-        gmail_connected = (
+        gmail_connected = bool(
             state.get(
                 "gmail_connected",
                 False
@@ -329,7 +380,7 @@ class ControlExecutor:
         if self.ib_app is None:
 
             log_warning(
-                "Consulta POSITIONS sin IBKR disponible."
+                "POSITIONS sin IBKR."
             )
 
             return (
@@ -356,6 +407,12 @@ class ControlExecutor:
                 0.0
             )
 
+            account_id = getattr(
+                self.ib_app,
+                "account_id",
+                None
+            )
+
             lines = []
 
             lines.append(
@@ -367,6 +424,14 @@ class ControlExecutor:
             )
 
             lines.append("")
+
+            if account_id:
+
+                lines.append(
+                    f"Cuenta: {account_id}"
+                )
+
+                lines.append("")
 
             lines.append(
                 "FDXM"
@@ -416,7 +481,7 @@ class ControlExecutor:
         if self.ib_app is None:
 
             log_warning(
-                "Consulta ACCOUNT sin IBKR disponible."
+                "ACCOUNT sin IBKR."
             )
 
             return (
@@ -427,64 +492,101 @@ class ControlExecutor:
 
         try:
 
+            # ------------------------------------------------
+            # Si el executor implementa directamente la capa
+            # de cuenta, la utilizamos.
+            # ------------------------------------------------
+
             if hasattr(
                 self.ib_app,
-                "isConnected"
+                "get_account_snapshot"
             ):
 
-                if not self.ib_app.isConnected():
+                account_data = (
+                    self.ib_app
+                    .get_account_snapshot()
+                )
 
-                    log_warning(
-                        "Consulta ACCOUNT bloqueada: "
-                        "IBKR desconectado."
-                    )
+            elif hasattr(
+                self.ib_app,
+                "get_account_summary"
+            ) and hasattr(
+                self.ib_app,
+                "request_account_summary"
+            ):
+
+                request_id = (
+                    self.ib_app
+                    .request_account_summary()
+                )
+
+                if request_id is None:
 
                     return (
                         "DAX BOT - CUENTA\n"
                         "================\n\n"
-                        "IBKR está desconectado."
+                        "No se pudo iniciar la consulta."
                     )
 
-            request_id = (
-                self.ib_app.request_account_summary()
-            )
-
-            if request_id is None:
-
-                log_error(
-                    "IBKR no devolvió Request ID "
-                    "para ACCOUNT SUMMARY."
+                account_data = (
+                    self.ib_app
+                    .get_account_summary(
+                        request_id
+                    )
                 )
 
-                return (
-                    "DAX BOT - CUENTA\n"
-                    "================\n\n"
-                    "No se pudo iniciar la consulta "
-                    "de cuenta."
-                )
+            else:
 
-            log_info(
-                f"Consulta ACCOUNT iniciada | "
-                f"RequestID={request_id}"
-            )
-
-            account_data = (
-                self.ib_app.get_account_summary(
-                    request_id
-                )
-            )
+                account_data = None
 
             if not account_data:
 
-                log_warning(
-                    f"ACCOUNT SUMMARY sin datos | "
-                    f"RequestID={request_id}"
+                account_id = getattr(
+                    self.ib_app,
+                    "account_id",
+                    None
                 )
 
-                return (
-                    "DAX BOT - CUENTA\n"
-                    "================\n\n"
-                    "IBKR no devolvió datos de cuenta."
+                accounts = getattr(
+                    self.ib_app,
+                    "accounts",
+                    []
+                )
+
+                lines = [
+                    "DAX BOT - CUENTA",
+                    "================",
+                    "",
+                ]
+
+                if account_id:
+
+                    lines.append(
+                        f"Cuenta: {account_id}"
+                    )
+
+                elif accounts:
+
+                    lines.append(
+                        f"Cuentas: {accounts}"
+                    )
+
+                else:
+
+                    lines.append(
+                        "Cuenta: N/D"
+                    )
+
+                lines.append("")
+
+                lines.append(
+                    "El executor LIVE actual "
+                    "no tiene todavía una capa "
+                    "AccountSummary implementada."
+                )
+
+                return "\n".join(
+                    lines
                 )
 
             net_liquidation = (
@@ -513,104 +615,26 @@ class ControlExecutor:
 
             currency = (
                 account_data.get(
-                    "Currency"
+                    "Currency",
+                    "EUR"
                 )
             )
 
-            if not currency:
-
-                raw_summary = getattr(
-                    self.ib_app,
-                    "account_summary",
-                    {}
-                )
-
-                for tag in (
-                    "NetLiquidation",
-                    "TotalCashValue",
-                    "AvailableFunds",
-                    "BuyingPower",
-                ):
-
-                    raw_data = (
-                        raw_summary.get(
-                            tag
-                        )
-                    )
-
-                    if isinstance(
-                        raw_data,
-                        dict
-                    ):
-
-                        currency = (
-                            raw_data.get(
-                                "currency"
-                            )
-                        )
-
-                        if currency:
-
-                            break
-
-            if not currency:
-
-                currency = "EUR"
-
-            lines = []
-
-            lines.append(
-                "DAX BOT - CUENTA"
-            )
-
-            lines.append(
-                "================"
-            )
-
-            lines.append("")
-
-            lines.append(
-                f"Divisa: {currency}"
-            )
-
-            lines.append("")
-
-            lines.append(
+            lines = [
+                "DAX BOT - CUENTA",
+                "================",
+                "",
+                f"Divisa: {currency}",
+                "",
                 f"Net Liquidation: "
-                f"{format_number(net_liquidation)}"
-            )
-
-            lines.append(
+                f"{format_number(net_liquidation)}",
                 f"Cash: "
-                f"{format_number(total_cash)}"
-            )
-
-            lines.append(
+                f"{format_number(total_cash)}",
                 f"Available Funds: "
-                f"{format_number(available_funds)}"
-            )
-
-            lines.append(
+                f"{format_number(available_funds)}",
                 f"Buying Power: "
-                f"{format_number(buying_power)}"
-            )
-
-            lines.append("")
-
-            lines.append(
-                "Datos consultados directamente "
-                "desde IBKR."
-            )
-
-            log_info(
-                f"ACCOUNT SUMMARY completado | "
-                f"RequestID={request_id} | "
-                f"Currency={currency} | "
-                f"NetLiquidation={net_liquidation} | "
-                f"Cash={total_cash} | "
-                f"AvailableFunds={available_funds} | "
-                f"BuyingPower={buying_power}"
-            )
+                f"{format_number(buying_power)}",
+            ]
 
             return "\n".join(
                 lines
@@ -631,191 +655,178 @@ class ControlExecutor:
             )
 
     # ========================================================
-    # EJECUCIÓN MANUAL DIRECTA
+    # OPERACIÓN MANUAL
     # ========================================================
 
-    def execute_manual_command(
+    def execute_manual(
         self,
-        control_email
+        command
     ):
-        """
-        Valida una orden manual y devuelve una señal
-        compatible con SignalExecutor.
-
-        IMPORTANTE:
-        Este método NO envía directamente la orden a IBKR.
-
-        Devuelve la señal para que bot_auto.py la pase al
-        mismo SignalExecutor utilizado por las señales
-        automáticas.
-        """
 
         command = (
-            str(
-                control_email.get(
-                    "command",
-                    ""
-                )
-            )
+            str(command)
             .strip()
             .upper()
         )
 
-        if command not in MANUAL_COMMANDS:
+        log_info(
+            f"Ejecutando comando manual | "
+            f"Command={command}"
+        )
+
+        if command not in (
+            SUPPORTED_MANUAL_COMMANDS
+        ):
 
             return {
                 "success": False,
                 "command": command,
-                "error": (
-                    "Comando manual no soportado."
-                ),
+                "subject":
+                    "DAX BOT - Control rechazado",
                 "body": (
-                    "Operación no soportada."
+                    "COMANDO NO SOPORTADO.\n\n"
+                    f"Comando: {command}"
                 )
             }
-
-        # ----------------------------------------------------
-        # IBKR disponible
-        # ----------------------------------------------------
 
         if self.ib_app is None:
 
             return {
                 "success": False,
                 "command": command,
-                "error": (
+                "subject":
+                    "DAX BOT - Operación manual",
+                "body": (
+                    "OPERACIÓN NO REALIZADA.\n\n"
                     "IBKR no está disponible."
-                ),
-                "body": (
-                    "No se ha enviado ninguna orden."
                 )
             }
 
-        # ----------------------------------------------------
-        # Estado del bot
-        # ----------------------------------------------------
-
-        state = (
-            bot_state.snapshot()
-        )
-
-        current_status = state.get(
-            "status"
-        )
-
-        if current_status != READY:
-
-            log_warning(
-                f"Orden manual bloqueada | "
-                f"Command={command} | "
-                f"BotStatus={current_status}"
-            )
+        if not self._ibkr_ready():
 
             return {
                 "success": False,
                 "command": command,
-                "error": (
-                    "El bot no está en estado READY."
-                ),
+                "subject":
+                    "DAX BOT - Operación manual",
                 "body": (
-                    f"Estado actual del bot: "
-                    f"{current_status}\n\n"
-                    "No se ha enviado ninguna orden."
+                    "OPERACIÓN NO REALIZADA.\n\n"
+                    "IBKR no está preparado para operar."
                 )
             }
 
         # ----------------------------------------------------
-        # Estado de conexión IBKR
-        # ----------------------------------------------------
-
-        if not state.get(
-            "ibkr_connected",
-            False
-        ):
-
-            log_warning(
-                f"Orden manual bloqueada | "
-                f"Command={command} | "
-                f"Motivo=IBKR desconectado"
-            )
-
-            return {
-                "success": False,
-                "command": command,
-                "error": (
-                    "IBKR no está conectado."
-                ),
-                "body": (
-                    "IBKR está desconectado.\n\n"
-                    "No se ha enviado ninguna orden."
-                )
-            }
-
-        # ----------------------------------------------------
-        # Comprobar conexión real de IBKR si está disponible
+        # Obtener posición antes de actuar.
         # ----------------------------------------------------
 
         try:
 
-            if hasattr(
-                self.ib_app,
-                "isConnected"
-            ):
-
-                if not self.ib_app.isConnected():
-
-                    log_warning(
-                        f"Orden manual bloqueada | "
-                        f"Command={command} | "
-                        f"Motivo=Socket IBKR desconectado"
-                    )
-
-                    return {
-                        "success": False,
-                        "command": command,
-                        "error": (
-                            "La conexión real con IBKR "
-                            "no está disponible."
-                        ),
-                        "body": (
-                            "IBKR está desconectado.\n\n"
-                            "No se ha enviado ninguna orden."
-                        )
-                    }
-
-        except Exception as error:
-
-            log_error(
-                f"Error comprobando conexión IBKR | "
-                f"{type(error).__name__}: {error}"
-            )
-
-            return {
-                "success": False,
-                "command": command,
-                "error": str(error),
-                "body": (
-                    "No se pudo verificar la conexión "
-                    "con IBKR.\n\n"
-                    "No se ha enviado ninguna orden."
-                )
-            }
-
-        # ----------------------------------------------------
-        # Obtener posición REAL
-        # ----------------------------------------------------
-
-        try:
-
-            position = float(
+            position = (
                 self.ib_app.get_position()
             )
 
         except Exception as error:
 
+            return {
+                "success": False,
+                "command": command,
+                "subject":
+                    "DAX BOT - Operación manual",
+                "body": (
+                    "OPERACIÓN NO REALIZADA.\n\n"
+                    "No se pudo consultar la posición.\n"
+                    f"Error: {error}"
+                )
+            }
+
+        # ----------------------------------------------------
+        # Decidir operación.
+        # ----------------------------------------------------
+
+        if command == OPEN_LONG:
+
+            if position != 0:
+
+                return self._manual_blocked(
+                    command,
+                    position,
+                    "Ya existe una posición abierta."
+                )
+
+            method_name = "open_long"
+
+        elif command == CLOSE_LONG:
+
+            if position <= 0:
+
+                return self._manual_blocked(
+                    command,
+                    position,
+                    "No existe un largo que cerrar."
+                )
+
+            method_name = "close_position"
+
+        elif command == OPEN_SHORT:
+
+            if position != 0:
+
+                return self._manual_blocked(
+                    command,
+                    position,
+                    "Ya existe una posición abierta."
+                )
+
+            method_name = "open_short"
+
+        else:
+
+            if position >= 0:
+
+                return self._manual_blocked(
+                    command,
+                    position,
+                    "No existe un corto que cerrar."
+                )
+
+            method_name = "close_position"
+
+        # ----------------------------------------------------
+        # El LiveExecutor mantiene actualmente una barrera
+        # de seguridad: la llamada devolverá BLOCKED mientras
+        # VALIDATION_ONLY esté activo.
+        # ----------------------------------------------------
+
+        method = getattr(
+            self.ib_app,
+            method_name,
+            None
+        )
+
+        if method is None:
+
+            return {
+                "success": False,
+                "command": command,
+                "subject":
+                    "DAX BOT - Operación manual",
+                "body": (
+                    "OPERACIÓN NO REALIZADA.\n\n"
+                    f"El executor no implementa "
+                    f"{method_name}()."
+                )
+            }
+
+        try:
+
+            result = (
+                method()
+            )
+
+        except Exception as error:
+
             log_error(
-                f"No se pudo obtener posición para "
-                f"operación manual | "
+                f"Error ejecutando comando manual | "
                 f"Command={command} | "
                 f"{type(error).__name__}: {error}"
             )
@@ -823,168 +834,112 @@ class ControlExecutor:
             return {
                 "success": False,
                 "command": command,
-                "error": (
-                    "No se pudo verificar la posición."
-                ),
+                "subject":
+                    "DAX BOT - Operación manual",
                 "body": (
-                    "No se pudo verificar la posición "
-                    "actual.\n\n"
-                    "No se ha enviado ninguna orden."
+                    "OPERACIÓN NO REALIZADA.\n\n"
+                    f"Error: {error}"
                 )
             }
 
-        # ====================================================
-        # VALIDACIÓN DE CADA OPERACIÓN
-        # ====================================================
+        if not isinstance(
+            result,
+            dict
+        ):
 
-        if command == "OPEN LONG":
-
-            if position != 0:
-
-                return self._manual_blocked(
-                    command,
-                    position,
-                    (
-                        "Ya existe una posición abierta."
-                    )
+            return {
+                "success": False,
+                "command": command,
+                "subject":
+                    "DAX BOT - Operación manual",
+                "body": (
+                    "OPERACIÓN NO REALIZADA.\n\n"
+                    "El executor devolvió un resultado "
+                    "no válido."
                 )
+            }
 
-            action = "ABRIR_LARGO"
-            expected_position = 1.0
+        success = bool(
+            result.get(
+                "success",
+                False
+            )
+        )
 
-        elif command == "CLOSE LONG":
+        final_position = result.get(
+            "position",
+            position
+        )
 
-            if position != 1:
+        status = result.get(
+            "status",
+            "UNKNOWN"
+        )
 
-                return self._manual_blocked(
-                    command,
-                    position,
-                    (
-                        "No existe un largo de "
-                        "1 contrato."
-                    )
-                )
+        order_id = result.get(
+            "order_id"
+        )
 
-            action = "CERRAR_LARGO"
-            expected_position = 0.0
+        price = result.get(
+            "price"
+        )
 
-        elif command == "OPEN SHORT":
+        error = result.get(
+            "error"
+        )
 
-            if position != 0:
+        if success:
 
-                return self._manual_blocked(
-                    command,
-                    position,
-                    (
-                        "Ya existe una posición abierta."
-                    )
-                )
+            subject = (
+                "DAX BOT - Operación manual realizada"
+            )
 
-            action = "ABRIR_CORTO"
-            expected_position = -1.0
+            body = (
+                "OPERACIÓN MANUAL REALIZADA\n\n"
+                f"Solicitud: {command}\n"
+                f"Estado: {status}\n"
+                f"Order ID: {order_id or 'N/A'}\n"
+                f"Cantidad: "
+                f"{result.get('filled', 0)}\n"
+                f"Precio: "
+                f"{format_number(price)}\n"
+                f"Posición final: "
+                f"{final_position}\n"
+            )
 
         else:
-            # CLOSE SHORT
 
-            if position != -1:
-
-                return self._manual_blocked(
-                    command,
-                    position,
-                    (
-                        "No existe un corto de "
-                        "1 contrato."
-                    )
-                )
-
-            action = "CERRAR_CORTO"
-            expected_position = 0.0
-
-        # ====================================================
-        # CREAR SEÑAL COMPATIBLE CON SIGNAL EXECUTOR
-        # ====================================================
-
-        message_id = (
-            "MANUAL:"
-            + str(
-                control_email.get(
-                    "message_id",
-                    ""
-                )
+            subject = (
+                "DAX BOT - Operación manual no realizada"
             )
-        )
 
-        signal = {
-
-            "message_id":
-                message_id,
-
-            "email_uid":
-                control_email.get(
-                    "email_uid"
-                ),
-
-            "sender":
-                control_email.get(
-                    "sender"
-                ),
-
-            "date":
-                control_email.get(
-                    "date"
-                ),
-
-            "subject":
-                control_email.get(
-                    "subject"
-                ),
-
-            "actions": [
-                action
-            ],
-
-            "manual":
-                True,
-
-            "manual_command":
-                command,
-
-            "position_initial":
-                position,
-
-            "expected_final_position":
-                expected_position,
-        }
-
-        log_info(
-            f"Orden manual validada | "
-            f"Command={command} | "
-            f"Action={action} | "
-            f"Position={position} | "
-            f"Expected={expected_position} | "
-            f"Message-ID={message_id}"
-        )
+            body = (
+                "OPERACIÓN MANUAL NO REALIZADA\n\n"
+                f"Solicitud: {command}\n"
+                f"Estado: {status}\n"
+                f"Posición: {final_position}\n"
+                f"Error: {error or 'N/A'}\n"
+            )
 
         return {
-            "success": True,
-            "command": command,
-            "action": action,
-            "signal": signal,
-            "position": position,
-            "expected_position": expected_position,
-            "body": (
-                f"Orden manual validada: "
-                f"{command}\n\n"
-                f"Posición actual: "
-                f"{format_number(position)}\n"
-                f"Posición esperada: "
-                f"{format_number(expected_position)}\n\n"
-                "Se enviará al SignalExecutor."
-            )
+            "success":
+                success,
+
+            "command":
+                command,
+
+            "subject":
+                subject,
+
+            "body":
+                body,
+
+            "result":
+                result
         }
 
     # ========================================================
-    # BLOQUEO DE OPERACIÓN MANUAL
+    # BLOQUEO MANUAL
     # ========================================================
 
     @staticmethod
@@ -995,28 +950,33 @@ class ControlExecutor:
     ):
 
         log_warning(
-            f"Operación manual bloqueada | "
+            f"Operacion manual bloqueada | "
             f"Command={command} | "
             f"Position={position} | "
             f"Reason={reason}"
         )
 
         return {
-            "success": False,
-            "command": command,
-            "position": position,
-            "error": reason,
+            "success":
+                False,
+
+            "command":
+                command,
+
+            "subject":
+                "DAX BOT - Operación manual bloqueada",
+
             "body": (
-                f"Operación: {command}\n\n"
-                f"Posición actual: "
-                f"{format_number(position)}\n\n"
+                "OPERACIÓN MANUAL BLOQUEADA\n\n"
+                f"Solicitud: {command}\n"
+                f"Posición actual: {position}\n"
                 f"Motivo: {reason}\n\n"
                 "No se ha enviado ninguna orden."
             )
         }
 
     # ========================================================
-    # COMANDOS DE CONSULTA
+    # EJECUTAR CUALQUIER COMANDO
     # ========================================================
 
     def execute(
@@ -1030,64 +990,129 @@ class ControlExecutor:
             .upper()
         )
 
+        if command == STATUS:
+
+            result = {
+                "success": True,
+                "command": STATUS,
+                "subject":
+                    "DAX BOT - Estado",
+                "body":
+                    self.get_status()
+            }
+
+        elif command == POSITIONS:
+
+            result = {
+                "success": True,
+                "command": POSITIONS,
+                "subject":
+                    "DAX BOT - Posiciones",
+                "body":
+                    self.get_positions()
+            }
+
+        elif command == ACCOUNT:
+
+            result = {
+                "success": True,
+                "command": ACCOUNT,
+                "subject":
+                    "DAX BOT - Cuenta",
+                "body":
+                    self.get_account()
+            }
+
+        elif command in (
+            SUPPORTED_MANUAL_COMMANDS
+        ):
+
+            result = self.execute_manual(
+                command
+            )
+
+        else:
+
+            log_warning(
+                f"Comando de control no soportado | "
+                f"Command={command}"
+            )
+
+            result = {
+                "success": False,
+                "command": command,
+                "subject":
+                    "DAX BOT - Comando rechazado",
+                "body": (
+                    "Comando no soportado.\n\n"
+                    f"Comando: {command}"
+                )
+            }
+
         log_info(
-            f"Ejecutando comando de control | "
-            f"Command={command}"
+            f"Resultado comando control | "
+            f"Command={command} | "
+            f"Success={result.get('success')}"
         )
 
-        if command == "STATUS":
+        return result
 
-            return {
-                "success": True,
-                "command": command,
-                "subject": (
-                    "DAX BOT - Estado"
-                ),
-                "body": self.get_status()
-            }
 
-        if command == "POSITIONS":
+# ============================================================
+# PRUEBA LOCAL SIN OPERAR
+# ============================================================
 
-            return {
-                "success": True,
-                "command": command,
-                "subject": (
-                    "DAX BOT - Posiciones"
-                ),
-                "body": self.get_positions()
-            }
+def main():
 
-        if command == "ACCOUNT":
+    print(
+        "========================================"
+    )
 
-            return {
-                "success": True,
-                "command": command,
-                "subject": (
-                    "DAX BOT - Cuenta"
-                ),
-                "body": self.get_account()
-            }
+    print(
+        "     CONTROL EXECUTOR - LIVE"
+    )
 
-        if command in MANUAL_COMMANDS:
+    print(
+        "========================================"
+    )
 
-            return self.execute_manual_command(
-                {
-                    "command": command
-                }
-            )
+    print(
+        "Comandos de consulta:"
+    )
 
-        log_warning(
-            f"Comando de control no soportado | "
-            f"Command={command}"
+    for command in sorted(
+        SUPPORTED_QUERY_COMMANDS
+    ):
+
+        print(
+            f"  - {command}"
         )
 
-        return {
-            "success": False,
-            "command": command,
-            "subject": (
-                "DAX BOT - Comando rechazado"
-            ),
-            "body": (
-                "Comando no soportado."
-            )
-        }
+    print()
+
+    print(
+        "Comandos manuales:"
+    )
+
+    for command in sorted(
+        SUPPORTED_MANUAL_COMMANDS
+    ):
+
+        print(
+            f"  - {command}"
+        )
+
+    print()
+
+    print(
+        "El LiveExecutor mantiene las órdenes"
+    )
+
+    print(
+        "bloqueadas mientras VALIDATION_ONLY=True."
+    )
+
+
+if __name__ == "__main__":
+
+    main()
