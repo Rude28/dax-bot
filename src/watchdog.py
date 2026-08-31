@@ -30,10 +30,10 @@ STATUS_FILE = os.path.join(
 
 BOT_SCRIPT = os.path.join(
     "src",
-    "bot_auto.py"
+    "bot_auto_live.py"
 )
 
-BOT_SCRIPT_NAME = "bot_auto.py"
+BOT_SCRIPT_NAME = "bot_auto_live.py"
 
 HEARTBEAT_TIMEOUT = float(
     os.getenv(
@@ -80,7 +80,7 @@ RESTART_COOLDOWN = float(
 WATCHDOG_AUTO_RECOVER = (
     os.getenv(
         "WATCHDOG_AUTO_RECOVER",
-        "true"
+        "false"
     )
     .strip()
     .lower()
@@ -659,7 +659,7 @@ def send_failure_alert(
         "========================\n\n"
 
         "El watchdog ha confirmado que "
-        "bot_auto.py no responde.\n\n"
+        "bot_auto_live.py no responde.\n\n"
 
         f"Hora de detección: "
         f"{utc_now_text()}\n\n"
@@ -777,14 +777,14 @@ def recover_bot():
     )
 
     print(
-        f"Proceso bot_auto.py detectado: "
+        f"Proceso bot_auto_live.py detectado: "
         f"{bot_running}"
     )
 
     if bot_running:
         print()
         print(
-            "Existe una instancia de bot_auto.py."
+            "Existe una instancia de bot_auto_live.py."
         )
 
         info = get_bot_process_info()
@@ -979,7 +979,7 @@ def watchdog_loop():
         "========================================"
     )
     print(
-        "         DAX BOT WATCHDOG"
+        "         DAX BOT LIVE WATCHDOG"
     )
     print(
         "========================================"

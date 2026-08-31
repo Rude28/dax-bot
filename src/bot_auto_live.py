@@ -163,7 +163,36 @@ CHECK_INTERVAL = 10
 # mediante VALIDATION_ONLY=True.
 # ============================================================
 
-LIVE_VALIDATION_ONLY = True
+LIVE_TRADING_ENABLED = (
+    os.getenv(
+        "LIVE_TRADING_ENABLED",
+        "false"
+    )
+    .strip()
+    .lower()
+    in (
+        "1",
+        "true",
+        "yes",
+        "on"
+    )
+)
+
+LIVE_VALIDATION_ONLY = (
+    os.getenv(
+        "LIVE_VALIDATION_ONLY",
+        "true"
+    )
+    .strip()
+    .lower()
+    in (
+        "1",
+        "true",
+        "yes",
+        "on"
+    )
+)
+
 IBKR_RECONNECT_INTERVAL = 5
 IBKR_RECONNECT_TIMEOUT = 10
 GMAIL_RECONNECT_INTERVAL = 5
@@ -412,6 +441,9 @@ def reconnect_gmail(
 
         attempt += 1
 
+        # El proceso sigue vivo durante la reconexión Gmail.
+        bot_state.heartbeat()
+
         bot_state.set_status(
             RECONNECTING_GMAIL
         )
@@ -630,6 +662,9 @@ def reconnect_ibkr(
     while True:
 
         attempt += 1
+
+        # El proceso sigue vivo durante la reconexión IBKR.
+        bot_state.heartbeat()
 
         bot_state.set_status(
             RECONNECTING_IBKR
@@ -2344,6 +2379,9 @@ def run():
     bot_state.mark_started()
     bot_state.set_status(STARTING)
 
+    # Heartbeat inicial para que el watchdog detecte el proceso.
+    bot_state.heartbeat()
+
     print()
     print(
         "========================================"
@@ -2361,13 +2399,23 @@ def run():
         "========================================"
     )
 
-    print(
-        "FASE: VALIDACIÓN LIVE"
-    )
-
-    print(
-        "ÓRDENES LIVE: BLOQUEADAS"
-    )
+    if (
+        LIVE_TRADING_ENABLED
+        and not LIVE_VALIDATION_ONLY
+    ):
+        print(
+            "FASE: LIVE TRADING ACTIVO"
+        )
+        print(
+            "ÓRDENES LIVE: HABILITADAS"
+        )
+    else:
+        print(
+            "FASE: VALIDACIÓN LIVE"
+        )
+        print(
+            "ÓRDENES LIVE: BLOQUEADAS"
+        )
 
     print(
         "========================================"
@@ -2493,6 +2541,10 @@ def run():
         )
 
         bot_state.set_position(ib_app.get_position())
+
+        # Heartbeat justo antes de declarar READY.
+        bot_state.heartbeat()
+
         bot_state.set_status(READY)
 
         log_info(
@@ -2506,6 +2558,12 @@ def run():
         while True:
 
             try:
+
+                # ------------------------------------------------
+                # HEARTBEAT
+                # ------------------------------------------------
+
+                bot_state.heartbeat()
 
                 # ------------------------------------------------
                 # Reconexión IBKR
@@ -2667,6 +2725,9 @@ def run():
                         email_uids
                     ):
 
+                        # Mantener heartbeat durante el procesamiento.
+                        bot_state.heartbeat()
+
                         process_signal(
                             mail,
                             email_uid,
@@ -2762,6 +2823,12 @@ def run():
                 )
 
                 return
+
+            # ------------------------------------------------
+            # HEARTBEAT FINAL DEL CICLO
+            # ------------------------------------------------
+
+            bot_state.heartbeat()
 
             print()
             print(

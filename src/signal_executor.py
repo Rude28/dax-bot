@@ -47,6 +47,33 @@ class SignalExecutor:
         )
 
     # ========================================================
+    # CANTIDAD DE CONTRATOS
+    # ========================================================
+
+    def _get_order_quantity(self):
+
+        quantity = getattr(
+            self.ib_app,
+            "order_quantity",
+            1
+        )
+
+        try:
+            quantity = int(quantity)
+        except (
+            TypeError,
+            ValueError
+        ):
+            quantity = 1
+
+        if quantity < 1:
+            raise ValueError(
+                "La cantidad de contratos debe ser >= 1."
+            )
+
+        return quantity
+
+    # ========================================================
     # CAPACIDAD DEL EXECUTOR
     # ========================================================
 
@@ -247,33 +274,32 @@ class SignalExecutor:
     # POSICIÓN FINAL ESPERADA
     # ========================================================
 
-    @staticmethod
     def _calculate_final_position(
+        self,
         initial_position,
         actions
     ):
+        """Calcula la posición final usando la cantidad del executor."""
 
-        position = (
+        position = float(
             initial_position
         )
+
+        quantity = self._get_order_quantity()
 
         for action in actions:
 
             if action == OPEN_LONG:
-
-                position += 1
+                position += quantity
 
             elif action == CLOSE_LONG:
-
-                position -= 1
+                position -= quantity
 
             elif action == OPEN_SHORT:
-
-                position -= 1
+                position -= quantity
 
             elif action == CLOSE_SHORT:
-
-                position += 1
+                position += quantity
 
         return position
 
@@ -296,6 +322,8 @@ class SignalExecutor:
             self.ib_app.get_position()
         )
 
+        quantity = self._get_order_quantity()
+
         # ----------------------------------------------------
         # Traducir acción de señal a acción IBKR.
         # ----------------------------------------------------
@@ -304,28 +332,28 @@ class SignalExecutor:
 
             ib_action = "BUY"
             expected_position = (
-                current_position + 1
+                current_position + quantity
             )
 
         elif signal_action == CLOSE_LONG:
 
             ib_action = "SELL"
             expected_position = (
-                current_position - 1
+                current_position - quantity
             )
 
         elif signal_action == OPEN_SHORT:
 
             ib_action = "SELL"
             expected_position = (
-                current_position - 1
+                current_position - quantity
             )
 
         elif signal_action == CLOSE_SHORT:
 
             ib_action = "BUY"
             expected_position = (
-                current_position + 1
+                current_position + quantity
             )
 
         else:
@@ -535,7 +563,9 @@ class SignalExecutor:
             self.ib_app.get_position()
         )
 
-        if initial_position != 1:
+        quantity = self._get_order_quantity()
+
+        if initial_position != quantity:
 
             return self._blocked_result(
                 signal,
@@ -661,7 +691,7 @@ class SignalExecutor:
                 )
             )
 
-        if final_position != -1:
+        if final_position != -quantity:
 
             return self._build_sequence_result(
                 signal,
@@ -692,7 +722,9 @@ class SignalExecutor:
             self.ib_app.get_position()
         )
 
-        if initial_position != -1:
+        quantity = self._get_order_quantity()
+
+        if initial_position != -quantity:
 
             return self._blocked_result(
                 signal,
@@ -818,7 +850,7 @@ class SignalExecutor:
                 )
             )
 
-        if final_position != 1:
+        if final_position != quantity:
 
             return self._build_sequence_result(
                 signal,

@@ -60,7 +60,17 @@ CURRENCY = os.getenv(
     "EUR"
 )
 
-QUANTITY = 1
+QUANTITY = int(
+    os.getenv(
+        "FDXM_QUANTITY",
+        "1"
+    )
+)
+
+if QUANTITY < 1:
+    raise ValueError(
+        "FDXM_QUANTITY debe ser un entero >= 1."
+    )
 
 ORDER_TIMEOUT = float(
     os.getenv(
@@ -202,6 +212,9 @@ class LiveExecutor(EWrapper, EClient):
         # ----------------------------------------------------
 
         self.environment = "LIVE"
+
+        # Cantidad de contratos configurada para LIVE.
+        self.order_quantity = QUANTITY
 
         # ----------------------------------------------------
         # LOCK
@@ -756,6 +769,19 @@ class LiveExecutor(EWrapper, EClient):
                 }
 
             # ------------------------------------------------
+            # Capturar posición ANTES de enviar la orden.
+            #
+            # La posición puede actualizarse asíncronamente
+            # después del Filled. Por eso expected_position
+            # debe calcularse desde esta fotografía inicial,
+            # nunca desde current_position después del Fill.
+            # ------------------------------------------------
+
+            initial_position = float(
+                self.current_position
+            )
+
+            # ------------------------------------------------
             # Order ID
             # ------------------------------------------------
 
@@ -843,6 +869,9 @@ class LiveExecutor(EWrapper, EClient):
             )
             print(
                 "ENVIANDO ORDEN LIVE"
+            )
+            print(
+                f"Posición inicial: {initial_position}"
             )
             print(
                 f"Accion:     {action}"
@@ -939,11 +968,11 @@ class LiveExecutor(EWrapper, EClient):
             if self.order_status == "Filled":
 
                 expected_position = (
-                    self.current_position
+                    initial_position
                     + self.order_filled
                     if action == "BUY"
                     else
-                    self.current_position
+                    initial_position
                     - self.order_filled
                 )
 
@@ -1251,7 +1280,7 @@ class LiveExecutor(EWrapper, EClient):
             position
         )
 
-        if quantity != QUANTITY:
+        if quantity != self.order_quantity:
 
             return {
                 "success": False,
